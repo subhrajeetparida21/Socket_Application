@@ -31,17 +31,33 @@ Start the server:
 ./server
 ```
 
+It will ask:
+
+- node port
+- client port
+
 Start lab nodes on up to 10 Linux systems:
 
 ```bash
-./node <server_ip>
+./node
 ```
+
+It will ask:
+
+- server IP / hostname
+- node port
 
 Submit a C file from a client machine:
 
 ```bash
-./client sample.c <server_ip>
+./client
 ```
+
+It will ask:
+
+- C source file path
+- server IP / hostname
+- client port
 
 ## Default ports
 
@@ -51,9 +67,9 @@ Submit a C file from a client machine:
 You can change them:
 
 ```bash
-./server 9000 9001
-./node <server_ip> 9000
-./client sample.c <server_ip> 9001
+./server
+./node
+./client
 ```
 
 ## Example test file

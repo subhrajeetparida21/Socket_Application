@@ -9,6 +9,24 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+static void prompt_text(const char *label, char *buffer, size_t size, const char *default_value) {
+    if (default_value && default_value[0] != '\0') {
+        printf("%s [%s]: ", label, default_value);
+    } else {
+        printf("%s: ", label);
+    }
+
+    if (!fgets(buffer, (int)size, stdin)) {
+        buffer[0] = '\0';
+        return;
+    }
+
+    buffer[strcspn(buffer, "\n")] = '\0';
+    if (buffer[0] == '\0' && default_value) {
+        snprintf(buffer, size, "%s", default_value);
+    }
+}
+
 static int connect_to_server(const char *host, int port) {
     int fd;
     struct sockaddr_in addr;
@@ -75,28 +93,28 @@ static char *read_file(const char *path, uint32_t *out_len) {
     return buffer;
 }
 
-int main(int argc, char *argv[]) {
-    const char *server_host = "127.0.0.1";
+int main(void) {
+    char code_path[256] = {0};
+    char server_host[128] = {0};
     int port = DEFAULT_CLIENT_PORT;
     uint32_t code_len = 0;
     uint32_t response_len = 0;
     char *code = NULL;
     char *response = NULL;
     int fd;
+    char input[32];
 
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <code_file.c> [server_host] [client_port]\n", argv[0]);
+    prompt_text("Enter C source file path", code_path, sizeof(code_path), NULL);
+    if (code_path[0] == '\0') {
+        fprintf(stderr, "Source file path is required.\n");
         return 1;
     }
 
-    if (argc >= 3) {
-        server_host = argv[2];
-    }
-    if (argc >= 4) {
-        port = atoi(argv[3]);
-    }
+    prompt_text("Enter server IP or hostname", server_host, sizeof(server_host), "127.0.0.1");
+    prompt_text("Enter client port", input, sizeof(input), "9001");
+    port = atoi(input);
 
-    code = read_file(argv[1], &code_len);
+    code = read_file(code_path, &code_len);
     if (!code) {
         fprintf(stderr, "Failed to read code file.\n");
         return 1;

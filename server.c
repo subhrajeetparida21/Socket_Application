@@ -21,6 +21,24 @@ typedef struct {
 static LabNode nodes[MAX_NODES];
 static pthread_mutex_t nodes_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static void prompt_text(const char *label, char *buffer, size_t size, const char *default_value) {
+    if (default_value && default_value[0] != '\0') {
+        printf("%s [%s]: ", label, default_value);
+    } else {
+        printf("%s: ", label);
+    }
+
+    if (!fgets(buffer, (int)size, stdin)) {
+        buffer[0] = '\0';
+        return;
+    }
+
+    buffer[strcspn(buffer, "\n")] = '\0';
+    if (buffer[0] == '\0' && default_value) {
+        snprintf(buffer, size, "%s", default_value);
+    }
+}
+
 static int create_listener(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -242,20 +260,20 @@ static void *accept_nodes(void *arg) {
     return NULL;
 }
 
-int main(int argc, char *argv[]) {
+int main(void) {
     int node_port = DEFAULT_NODE_PORT;
     int client_port = DEFAULT_CLIENT_PORT;
     int node_listener;
     int client_listener;
     pthread_t node_thread;
     pthread_t client_thread;
+    char input[32];
 
-    if (argc >= 2) {
-        node_port = atoi(argv[1]);
-    }
-    if (argc >= 3) {
-        client_port = atoi(argv[2]);
-    }
+    prompt_text("Enter node port", input, sizeof(input), "9000");
+    node_port = atoi(input);
+
+    prompt_text("Enter client port", input, sizeof(input), "9001");
+    client_port = atoi(input);
 
     for (int i = 0; i < MAX_NODES; i++) {
         pthread_mutex_init(&nodes[i].lock, NULL);

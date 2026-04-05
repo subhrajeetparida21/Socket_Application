@@ -12,6 +12,24 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+static void prompt_text(const char *label, char *buffer, size_t size, const char *default_value) {
+    if (default_value && default_value[0] != '\0') {
+        printf("%s [%s]: ", label, default_value);
+    } else {
+        printf("%s: ", label);
+    }
+
+    if (!fgets(buffer, (int)size, stdin)) {
+        buffer[0] = '\0';
+        return;
+    }
+
+    buffer[strcspn(buffer, "\n")] = '\0';
+    if (buffer[0] == '\0' && default_value) {
+        snprintf(buffer, size, "%s", default_value);
+    }
+}
+
 static int connect_to_server(const char *host, int port) {
     int fd;
     struct sockaddr_in addr;
@@ -165,18 +183,16 @@ static char *run_code(const char *source_code, uint32_t *out_len) {
     return buffer;
 }
 
-int main(int argc, char *argv[]) {
-    const char *server_host = "127.0.0.1";
+int main(void) {
+    char server_host[128] = {0};
     int port = DEFAULT_NODE_PORT;
     int fd;
     char host_name[64] = {0};
+    char input[32];
 
-    if (argc >= 2) {
-        server_host = argv[1];
-    }
-    if (argc >= 3) {
-        port = atoi(argv[2]);
-    }
+    prompt_text("Enter server IP or hostname", server_host, sizeof(server_host), "127.0.0.1");
+    prompt_text("Enter node port", input, sizeof(input), "9000");
+    port = atoi(input);
 
     gethostname(host_name, sizeof(host_name) - 1);
     fd = connect_to_server(server_host, port);
