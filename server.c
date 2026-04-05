@@ -1,7 +1,25 @@
+/*
+ * server.c  –  Load-Balancer Server
+ *
+ * Accepts C source code from clients, queries all registered lab nodes for
+ * their current load, forwards the job to the **least-loaded** node, and
+ * relays the output back to the client.
+ *
+ * Protocol (client ↔ load-balancer):
+ *   Client → LB : send_string(source_code, len)
+ *   LB → Client : send_string(output, len)
+ *
+ * Protocol (load-balancer ↔ node):
+ *   LB → Node : send_u32(MSG_QUERY_LOAD)   → Node replies send_u32(active_jobs)
+ *   LB → Node : send_u32(MSG_RUN_CODE)
+ *               send_string(source, len)    → Node replies send_string(output, len)
+ */
+
 #include "common.h"
 
 #include <arpa/inet.h>
 #include <limits.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -9,192 +27,145 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
-static void prompt_text(const char *label, char *buffer, size_t size, const char *default_value) {
-    if (default_value && default_value[0] != '\0') {
-        printf("%s [%s]: ", label, default_value);
-    } else {
-        printf("%s: ", label);
-    }
+/* ── node registry ──────────────────────────────────────────────────── */
+typedef struct {
+    char ip[128];
+    int  port;
+} NodeInfo;
 
-    if (!fgets(buffer, (int)size, stdin)) {
-        buffer[0] = '\0';
-        return;
-    }
+static NodeInfo g_nodes[MAX_NODES];
+static int      g_node_count = 0;
 
-    buffer[strcspn(buffer, "\n")] = '\0';
-    if (buffer[0] == '\0' && default_value) {
-        snprintf(buffer, size, "%s", default_value);
-    }
-}
-
-static int create_listener(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
+/* ── connect to a node ──────────────────────────────────────────────── */
+static int connect_to_node(const NodeInfo *n) {
+    int fd;
     struct sockaddr_in addr;
+    struct hostent    *he;
 
-    if (fd < 0) {
-        perror("socket");
-        exit(1);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); return -1; }
+
+    /* resolve hostname or dotted-decimal IP */
+    he = gethostbyname(n->ip);
+    if (!he) {
+        fprintf(stderr, "[lb] Cannot resolve node host %s\n", n->ip);
+        close(fd);
+        return -1;
     }
-
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
+    addr.sin_port   = htons(n->port);
+    memcpy(&addr.sin_addr.s_addr, he->h_addr, he->h_length);
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("[lb] connect to node");
         close(fd);
-        exit(1);
+        return -1;
     }
-
-    if (listen(fd, 16) < 0) {
-        perror("listen");
-        close(fd);
-        exit(1);
-    }
-
     return fd;
 }
 
-static char *read_text_file(const char *path, uint32_t *out_len) {
-    FILE *fp = fopen(path, "rb");
-    char *buffer = NULL;
-    long size = 0;
+/* ── query a single node's load ─────────────────────────────────────── */
+static int query_node_load(const NodeInfo *n) {
+    int      fd = connect_to_node(n);
+    uint32_t load = UINT32_MAX;     /* treat unreachable node as infinitely busy */
 
-    if (!fp) {
-        buffer = strdup("Failed to open result file.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
+    if (fd < 0) return (int)UINT32_MAX;
+
+    if (send_u32(fd, MSG_QUERY_LOAD) < 0 || recv_u32(fd, &load) < 0) {
+        fprintf(stderr, "[lb] Failed to query load from %s:%d\n", n->ip, n->port);
+        load = UINT32_MAX;
     }
-
-    fseek(fp, 0, SEEK_END);
-    size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (size < 0) {
-        fclose(fp);
-        buffer = strdup("Failed to read result file size.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
-    }
-
-    buffer = (char *)malloc((size_t)size + 1);
-    if (!buffer) {
-        fclose(fp);
-        buffer = strdup("Memory allocation failed.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
-    }
-
-    if (size > 0) {
-        fread(buffer, 1, (size_t)size, fp);
-    }
-    buffer[size] = '\0';
-    fclose(fp);
-
-    if (size == 0) {
-        free(buffer);
-        buffer = strdup("Program finished with no output.\n");
-        size = (long)strlen(buffer);
-    }
-
-    *out_len = (uint32_t)size;
-    return buffer;
+    close(fd);
+    return (int)load;
 }
 
-static char *run_code(const char *source_code, uint32_t *out_len) {
-    char source_template[] = "/tmp/lab_code_XXXXXX.c";
-    char binary_path[PATH_MAX];
-    char output_template[] = "/tmp/lab_out_XXXXXX.txt";
-    int source_fd = -1;
-    int output_fd = -1;
-    pid_t pid;
-    int status;
-    char *buffer = NULL;
+/* ── pick the least-loaded node index ──────────────────────────────── */
+static int pick_node(void) {
+    int best_idx  = -1;
+    int best_load = INT_MAX;
 
-    source_fd = mkstemps(source_template, 2);
-    if (source_fd < 0) {
-        buffer = strdup("Failed to create temp source file.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
+    for (int i = 0; i < g_node_count; i++) {
+        int load = query_node_load(&g_nodes[i]);
+        printf("[lb] Node %s:%d  load=%d\n", g_nodes[i].ip, g_nodes[i].port, load);
+        if (load < best_load) {
+            best_load = load;
+            best_idx  = i;
+        }
     }
-
-    if (write(source_fd, source_code, strlen(source_code)) < 0) {
-        close(source_fd);
-        unlink(source_template);
-        buffer = strdup("Failed to write source file.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
-    }
-    close(source_fd);
-
-    snprintf(binary_path, sizeof(binary_path), "%s.bin", source_template);
-
-    output_fd = mkstemps(output_template, 4);
-    if (output_fd < 0) {
-        unlink(source_template);
-        buffer = strdup("Failed to create temp output file.\n");
-        *out_len = (uint32_t)strlen(buffer);
-        return buffer;
-    }
-    close(output_fd);
-
-    pid = fork();
-    if (pid == 0) {
-        freopen(output_template, "w", stdout);
-        freopen(output_template, "a", stderr);
-        execlp("gcc", "gcc", source_template, "-O2", "-o", binary_path, NULL);
-        _exit(1);
-    }
-    waitpid(pid, &status, 0);
-
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        buffer = read_text_file(output_template, out_len);
-        unlink(source_template);
-        unlink(output_template);
-        return buffer;
-    }
-
-    pid = fork();
-    if (pid == 0) {
-        freopen(output_template, "w", stdout);
-        freopen(output_template, "a", stderr);
-        execl(binary_path, binary_path, NULL);
-        _exit(1);
-    }
-    waitpid(pid, &status, 0);
-
-    buffer = read_text_file(output_template, out_len);
-
-    unlink(source_template);
-    unlink(binary_path);
-    unlink(output_template);
-    return buffer;
+    return best_idx;
 }
 
-static void *client_worker(void *arg) {
-    int client_fd = *(int *)arg;
-    uint32_t code_len = 0;
-    uint32_t output_len = 0;
-    char *source = NULL;
+/* ── forward job to chosen node, get output ─────────────────────────── */
+static char *run_on_node(const NodeInfo *n, const char *source,
+                         uint32_t src_len, uint32_t *out_len) {
+    int   fd;
     char *output = NULL;
 
+    fd = connect_to_node(n);
+    if (fd < 0) {
+        const char *err = "Load balancer: could not connect to lab node.\n";
+        output   = strdup(err);
+        *out_len = (uint32_t)strlen(err);
+        return output;
+    }
+
+    if (send_u32(fd, MSG_RUN_CODE) < 0 ||
+        send_string(fd, source, src_len) < 0) {
+        close(fd);
+        const char *err = "Load balancer: failed to send code to node.\n";
+        output   = strdup(err);
+        *out_len = (uint32_t)strlen(err);
+        return output;
+    }
+
+    output = recv_string(fd, out_len);
+    close(fd);
+
+    if (!output) {
+        output   = strdup("Load balancer: failed to receive output from node.\n");
+        *out_len = (uint32_t)strlen(output);
+    }
+    return output;
+}
+
+/* ── per-client thread ─────────────────────────────────────────────── */
+typedef struct { int fd; } ClientArg;
+
+static void *handle_client(void *arg) {
+    int      client_fd = ((ClientArg *)arg)->fd;
+    uint32_t code_len  = 0;
+    uint32_t out_len   = 0;
+    char    *source    = NULL;
+    char    *output    = NULL;
+    int      node_idx;
     free(arg);
 
     source = recv_string(client_fd, &code_len);
     if (!source) {
+        fprintf(stderr, "[lb] Failed to receive source from client\n");
         close(client_fd);
         return NULL;
     }
 
-    output = run_code(source, &output_len);
-    send_string(client_fd, output, output_len);
+    node_idx = pick_node();
+    if (node_idx < 0) {
+        const char *err = "No lab nodes available.\n";
+        send_string(client_fd, err, (uint32_t)strlen(err));
+        free(source);
+        close(client_fd);
+        return NULL;
+    }
+
+    printf("[lb] Routing job to node %s:%d\n",
+           g_nodes[node_idx].ip, g_nodes[node_idx].port);
+    fflush(stdout);
+
+    output = run_on_node(&g_nodes[node_idx], source, code_len, &out_len);
+    send_string(client_fd, output, out_len);
 
     free(source);
     free(output);
@@ -202,33 +173,99 @@ static void *client_worker(void *arg) {
     return NULL;
 }
 
+/* ── listener ───────────────────────────────────────────────────────── */
+static int create_listener(int port) {
+    int fd  = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    struct sockaddr_in addr;
+
+    if (fd < 0) { perror("socket"); exit(1); }
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); close(fd); exit(1);
+    }
+    if (listen(fd, 16) < 0) {
+        perror("listen"); close(fd); exit(1);
+    }
+    return fd;
+}
+
+/* ── main ───────────────────────────────────────────────────────────── */
 int main(void) {
-    int port = DEFAULT_CLIENT_PORT;
-    int listener;
-    char input[32];
+    char input[128];
+    int  lb_port;
+    int  listener;
 
-    prompt_text("Enter server port", input, sizeof(input), "9001");
-    port = atoi(input);
+    /* ── 1. Configure load-balancer port ── */
+    printf("Enter load-balancer port [%d]: ", DEFAULT_LB_PORT);
+    fflush(stdout);
+    if (fgets(input, sizeof(input), stdin)) {
+        input[strcspn(input, "\n")] = '\0';
+        lb_port = (input[0] != '\0') ? atoi(input) : DEFAULT_LB_PORT;
+    } else {
+        lb_port = DEFAULT_LB_PORT;
+    }
 
-    listener = create_listener(port);
+    /* ── 2. Register lab nodes ── */
+    printf("How many lab nodes (1–%d)? ", MAX_NODES);
+    fflush(stdout);
+    if (!fgets(input, sizeof(input), stdin)) { g_node_count = 0; }
+    else {
+        input[strcspn(input, "\n")] = '\0';
+        g_node_count = atoi(input);
+        if (g_node_count < 1)        g_node_count = 1;
+        if (g_node_count > MAX_NODES) g_node_count = MAX_NODES;
+    }
 
-    printf("Server ready on port %d\n", port);
+    for (int i = 0; i < g_node_count; i++) {
+        char def_port[16];
+        snprintf(def_port, sizeof(def_port), "%d", DEFAULT_NODE_BASE_PORT + i);
+
+        printf("Node %d IP [127.0.0.1]: ", i + 1);
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            input[strcspn(input, "\n")] = '\0';
+            snprintf(g_nodes[i].ip, sizeof(g_nodes[i].ip),
+                     "%s", (input[0] != '\0') ? input : "127.0.0.1");
+        } else {
+            snprintf(g_nodes[i].ip, sizeof(g_nodes[i].ip), "127.0.0.1");
+        }
+
+        printf("Node %d port [%s]: ", i + 1, def_port);
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            input[strcspn(input, "\n")] = '\0';
+            g_nodes[i].port = (input[0] != '\0') ? atoi(input) : atoi(def_port);
+        } else {
+            g_nodes[i].port = atoi(def_port);
+        }
+
+        printf("[lb] Registered node %d → %s:%d\n",
+               i + 1, g_nodes[i].ip, g_nodes[i].port);
+    }
+
+    /* ── 3. Start accepting clients ── */
+    listener = create_listener(lb_port);
+    printf("[lb] Load-balancer ready on port %d  (%d node(s) registered)\n",
+           lb_port, g_node_count);
+    fflush(stdout);
 
     while (1) {
-        int *client_fd = (int *)malloc(sizeof(int));
-        pthread_t tid;
+        ClientArg *ca  = (ClientArg *)malloc(sizeof(ClientArg));
+        pthread_t  tid;
+        if (!ca) continue;
 
-        if (!client_fd) {
-            continue;
-        }
+        ca->fd = accept(listener, NULL, NULL);
+        if (ca->fd < 0) { free(ca); continue; }
 
-        *client_fd = accept(listener, NULL, NULL);
-        if (*client_fd < 0) {
-            free(client_fd);
-            continue;
-        }
-
-        pthread_create(&tid, NULL, client_worker, client_fd);
+        pthread_create(&tid, NULL, handle_client, ca);
         pthread_detach(tid);
     }
 

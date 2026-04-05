@@ -84,7 +84,7 @@ static char *read_file(const char *path, uint32_t *out_len) {
     }
 
     if (size > 0) {
-        fread(buffer, 1, (size_t)size, fp);
+        size_t nr = fread(buffer, 1, (size_t)size, fp); (void)nr;
     }
     buffer[size] = '\0';
     fclose(fp);
@@ -96,7 +96,7 @@ static char *read_file(const char *path, uint32_t *out_len) {
 int main(void) {
     char code_path[256] = {0};
     char server_host[128] = {0};
-    int port = DEFAULT_CLIENT_PORT;
+    int port = DEFAULT_LB_PORT;
     uint32_t code_len = 0;
     uint32_t response_len = 0;
     char *code = NULL;
@@ -111,7 +111,7 @@ int main(void) {
     }
 
     prompt_text("Enter server IP or hostname", server_host, sizeof(server_host), "127.0.0.1");
-    prompt_text("Enter server port", input, sizeof(input), "9001");
+    prompt_text("Enter server port", input, sizeof(input), "9001");  /* load-balancer port */
     port = atoi(input);
 
     code = read_file(code_path, &code_len);
