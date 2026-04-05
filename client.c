@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -69,66 +70,50 @@ static char *recv_str(int fd, uint32_t *out_len) {
     return buf;
 }
 
-/* ── compile and run source code, return stdout+stderr ───────────────── */
-static char *run_code(const char *source) {
-    char src_tpl[] = "/tmp/lab_src_XXXXXX.c";
+static int write_all(int fd, const void *buf, size_t len) {
+    const char *p = (const char *)buf;
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, p + sent, len - sent);
+        if (n <= 0) return -1;
+        sent += (size_t)n;
+    }
+    return 0;
+}
+
+/* ── run binary payload and capture stdout+stderr ─────────────────────── */
+static char *run_binary(const char *binary, uint32_t bin_len) {
+    char bin_tpl[] = "/tmp/lab_exec_XXXXXX";
     char out_tpl[] = "/tmp/lab_out_XXXXXX.txt";
-    char bin_path[PATH_MAX];
+    int bin_fd = mkstemp(bin_tpl);
+    if (bin_fd < 0) return strdup("client: failed to create temp binary file.\n");
 
-    /* Write source to temp file */
-    int src_fd = mkstemps(src_tpl, 2);    /* .c suffix → len 2 */
-    if (src_fd < 0) return strdup("client: failed to create temp file.\n");
-    size_t wn = write(src_fd, source, strlen(source)); (void)wn;
-    close(src_fd);
+    if (write_all(bin_fd, binary, bin_len) < 0) {
+        close(bin_fd);
+        unlink(bin_tpl);
+        return strdup("client: failed to write binary payload.\n");
+    }
+    close(bin_fd);
+    chmod(bin_tpl, 0700);
 
-    snprintf(bin_path, sizeof(bin_path), "%s.bin", src_tpl);
-
-    /* Create output capture file */
-    int out_fd = mkstemps(out_tpl, 4);    /* .txt suffix → len 4 */
-    if (out_fd < 0) { unlink(src_tpl); return strdup("client: failed to create output file.\n"); }
+    int out_fd = mkstemps(out_tpl, 4);
+    if (out_fd < 0) {
+        unlink(bin_tpl);
+        return strdup("client: failed to create output file.\n");
+    }
     close(out_fd);
 
-    /* ── Compile ── */
     pid_t pid = fork();
     if (pid == 0) {
         int ofd = open(out_tpl, O_WRONLY | O_TRUNC);
         if (ofd >= 0) { dup2(ofd, STDOUT_FILENO); dup2(ofd, STDERR_FILENO); close(ofd); }
-        execlp("gcc", "gcc", src_tpl, "-O2", "-o", bin_path, NULL);
+        execl(bin_tpl, bin_tpl, NULL);
         _exit(1);
     }
+
     int status;
     waitpid(pid, &status, 0);
 
-    /* On compile error, return compiler output */
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        FILE *fp = fopen(out_tpl, "r");
-        char *err = NULL;
-        if (fp) {
-            fseek(fp, 0, SEEK_END);
-            long sz = ftell(fp); fseek(fp, 0, SEEK_SET);
-            err = (char *)malloc(sz + 64);
-            snprintf(err, 64, "[compile error]\n");
-            size_t nr = fread(err + strlen(err), 1, sz, fp); (void)nr;
-            err[strlen(err)] = '\0';
-            fclose(fp);
-        } else {
-            err = strdup("[compile error — could not read output]\n");
-        }
-        unlink(src_tpl); unlink(out_tpl);
-        return err;
-    }
-
-    /* ── Run ── */
-    pid = fork();
-    if (pid == 0) {
-        int ofd = open(out_tpl, O_WRONLY | O_TRUNC);
-        if (ofd >= 0) { dup2(ofd, STDOUT_FILENO); dup2(ofd, STDERR_FILENO); close(ofd); }
-        execl(bin_path, bin_path, NULL);
-        _exit(1);
-    }
-    waitpid(pid, &status, 0);
-
-    /* Read output */
     char *result = NULL;
     FILE *fp = fopen(out_tpl, "r");
     if (fp) {
@@ -146,8 +131,7 @@ static char *run_code(const char *source) {
         result = strdup("(could not read output file)\n");
     }
 
-    unlink(src_tpl);
-    unlink(bin_path);
+    unlink(bin_tpl);
     unlink(out_tpl);
     return result;
 }
@@ -201,10 +185,10 @@ int main(void) {
             break;
         }
 
-        printf("[client] Received job (%u bytes) — compiling and running...\n", src_len);
+        printf("[client] Received job (%u bytes) — running binary...\n", src_len);
         fflush(stdout);
 
-        char *output = run_code(source);
+        char *output = run_binary(source, src_len);
         uint32_t out_len = (uint32_t)strlen(output);
 
         if (send_str(fd, output, out_len) < 0) {
