@@ -131,43 +131,13 @@ static void *acceptor(void *arg) {
     return NULL;
 }
 
-/* ── detect WSL ─────────────────────────────────────────────────────── */
-static int is_wsl(void) {
-    FILE *fp = fopen("/proc/version", "r");
-    if (!fp) return 0;
-    char line[256] = {0};
-    size_t nr = fread(line, 1, sizeof(line) - 1, fp); (void)nr;
-    fclose(fp);
-    /* /proc/version contains "microsoft" or "Microsoft" on WSL */
-    return (strstr(line, "icrosoft") != NULL);
-}
-
-/* Get the Windows host IP from WSL's /etc/resolv.conf (nameserver line) */
-static int get_windows_host_ip(char *buf, size_t size) {
-    FILE *fp = fopen("/etc/resolv.conf", "r");
-    if (!fp) return 0;
-    char line[128];
-    while (fgets(line, sizeof(line), fp)) {
-        if (strncmp(line, "nameserver", 10) == 0) {
-            char *p = line + 10;
-            while (*p == ' ' || *p == '\t') p++;
-            p[strcspn(p, " \t\n\r")] = '\0';
-            strncpy(buf, p, size - 1); buf[size - 1] = '\0';
-            fclose(fp);
-            return 1;
-        }
-    }
-    fclose(fp);
-    return 0;
-}
-
-/* ── get outbound IP (WSL virtual IP) ────────────────────────────────── */
+/* ── get outbound IP ─────────────────────────────────────────────────── */
 static void get_local_ip(char *buf, size_t size) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in remote;
     memset(&remote, 0, sizeof(remote));
-    remote.sin_family = AF_INET;
-    remote.sin_port   = htons(80);
+    remote.sin_family      = AF_INET;
+    remote.sin_port        = htons(80);
     inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
     connect(s, (struct sockaddr *)&remote, sizeof(remote));
     struct sockaddr_in local;
@@ -264,26 +234,8 @@ int main(void) {
         return 1;
     }
 
-    if (is_wsl()) {
-        char winip[INET_ADDRSTRLEN] = "(not found)";
-        get_windows_host_ip(winip, sizeof(winip));
-        printf("\n");
-        printf("╔══════════════════════════════════════════════════════════╗\n");
-        printf("║              RUNNING INSIDE WSL — READ THIS             ║\n");
-        printf("╠══════════════════════════════════════════════════════════╣\n");
-        printf("║  WSL IP (not reachable from other machines): %-14s║\n", myip);
-        printf("║  Windows host IP (use this for clients):     %-14s║\n", winip);
-        printf("║                                                          ║\n");
-        printf("║  Run this in Windows CMD/PowerShell (as Admin):          ║\n");
-        printf("║  netsh interface portproxy add v4tov4 ^                  ║\n");
-        printf("║    listenport=%d listenaddress=0.0.0.0 ^               ║\n", port);
-        printf("║    connectport=%d connectaddress=%s       ║\n", port, myip);
-        printf("╚══════════════════════════════════════════════════════════╝\n");
-        printf("\n[server] Clients should connect to: %s : %d\n", winip, port);
-    } else {
-        printf("[server] Listening on %s : %d\n", myip, port);
-        printf("[server] Clients connect to this IP and port.\n");
-    }
+    printf("[server] Listening on  %s : %d\n", myip, port);
+    printf("[server] Tell clients to connect to this IP and port.\n");
     printf("[server] Waiting for clients to join...\n\n");
 
     /* Start acceptor thread */
