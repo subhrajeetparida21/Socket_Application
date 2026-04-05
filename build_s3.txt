@@ -1,0 +1,16 @@
+/mnt/c/Users/pkone/OneDrive/Desktop/Os/Socket_Application/server.c: In function ‘main’:
+/mnt/c/Users/pkone/OneDrive/Desktop/Os/Socket_Application/server.c:155:34: warning: ‘%s’ directive output may be truncated writing up to 117 bytes into a region of size 16 [-Wformat-truncation=]
+  155 |             snprintf(buf, size, "%s", p);
+      |                                  ^~
+In file included from /usr/include/stdio.h:980,
+                 from /mnt/c/Users/pkone/OneDrive/Desktop/Os/Socket_Application/server.c:21:
+In function ‘snprintf’,
+    inlined from ‘get_windows_host_ip’ at /mnt/c/Users/pkone/OneDrive/Desktop/Os/Socket_Application/server.c:155:13,
+    inlined from ‘main’ at /mnt/c/Users/pkone/OneDrive/Desktop/Os/Socket_Application/server.c:269:9:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:10: note: ‘__builtin_snprintf’ output between 1 and 118 bytes into a destination of size 16
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
