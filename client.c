@@ -111,7 +111,7 @@ int main(void) {
     }
 
     prompt_text("Enter server IP or hostname", server_host, sizeof(server_host), "127.0.0.1");
-    prompt_text("Enter client port", input, sizeof(input), "9001");
+    prompt_text("Enter server port", input, sizeof(input), "9001");
     port = atoi(input);
 
     code = read_file(code_path, &code_len);

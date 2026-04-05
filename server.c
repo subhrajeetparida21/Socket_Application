@@ -1,25 +1,16 @@
 #include "common.h"
 
 #include <arpa/inet.h>
-#include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
-
-typedef struct {
-    int active;
-    int busy;
-    int socket_fd;
-    char name[64];
-    pthread_mutex_t lock;
-} LabNode;
-
-static LabNode nodes[MAX_NODES];
-static pthread_mutex_t nodes_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void prompt_text(const char *label, char *buffer, size_t size, const char *default_value) {
     if (default_value && default_value[0] != '\0') {
@@ -71,70 +62,128 @@ static int create_listener(int port) {
     return fd;
 }
 
-static void remove_node(int index) {
-    if (nodes[index].active) {
-        close(nodes[index].socket_fd);
-        nodes[index].active = 0;
-        nodes[index].busy = 0;
-        nodes[index].name[0] = '\0';
+static char *read_text_file(const char *path, uint32_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    char *buffer = NULL;
+    long size = 0;
+
+    if (!fp) {
+        buffer = strdup("Failed to open result file.\n");
+        *out_len = (uint32_t)strlen(buffer);
+        return buffer;
     }
+
+    fseek(fp, 0, SEEK_END);
+    size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (size < 0) {
+        fclose(fp);
+        buffer = strdup("Failed to read result file size.\n");
+        *out_len = (uint32_t)strlen(buffer);
+        return buffer;
+    }
+
+    buffer = (char *)malloc((size_t)size + 1);
+    if (!buffer) {
+        fclose(fp);
+        buffer = strdup("Memory allocation failed.\n");
+        *out_len = (uint32_t)strlen(buffer);
+        return buffer;
+    }
+
+    if (size > 0) {
+        fread(buffer, 1, (size_t)size, fp);
+    }
+    buffer[size] = '\0';
+    fclose(fp);
+
+    if (size == 0) {
+        free(buffer);
+        buffer = strdup("Program finished with no output.\n");
+        size = (long)strlen(buffer);
+    }
+
+    *out_len = (uint32_t)size;
+    return buffer;
 }
 
-static int reserve_best_node(double *best_load) {
-    int chosen = -1;
-    double chosen_load = 0.0;
+static char *run_code(const char *source_code, uint32_t *out_len) {
+    char source_template[] = "/tmp/lab_code_XXXXXX.c";
+    char binary_path[PATH_MAX];
+    char output_template[] = "/tmp/lab_out_XXXXXX.txt";
+    int source_fd = -1;
+    int output_fd = -1;
+    pid_t pid;
+    int status;
+    char *buffer = NULL;
 
-    pthread_mutex_lock(&nodes_mutex);
-    for (int i = 0; i < MAX_NODES; i++) {
-        double current_load = 0.0;
-
-        if (!nodes[i].active || nodes[i].busy) {
-            continue;
-        }
-
-        pthread_mutex_lock(&nodes[i].lock);
-        if (send_string(nodes[i].socket_fd, "LOAD", 4) < 0 ||
-            recv_double(nodes[i].socket_fd, &current_load) < 0) {
-            pthread_mutex_unlock(&nodes[i].lock);
-            remove_node(i);
-            continue;
-        }
-        pthread_mutex_unlock(&nodes[i].lock);
-
-        if (chosen == -1 || current_load < chosen_load) {
-            chosen = i;
-            chosen_load = current_load;
-        }
+    source_fd = mkstemps(source_template, 2);
+    if (source_fd < 0) {
+        buffer = strdup("Failed to create temp source file.\n");
+        *out_len = (uint32_t)strlen(buffer);
+        return buffer;
     }
 
-    if (chosen >= 0) {
-        nodes[chosen].busy = 1;
+    if (write(source_fd, source_code, strlen(source_code)) < 0) {
+        close(source_fd);
+        unlink(source_template);
+        buffer = strdup("Failed to write source file.\n");
+        *out_len = (uint32_t)strlen(buffer);
+        return buffer;
     }
-    pthread_mutex_unlock(&nodes_mutex);
+    close(source_fd);
 
-    if (best_load && chosen >= 0) {
-        *best_load = chosen_load;
+    snprintf(binary_path, sizeof(binary_path), "%s.bin", source_template);
+
+    output_fd = mkstemps(output_template, 4);
+    if (output_fd < 0) {
+        unlink(source_template);
+        buffer = strdup("Failed to create temp output file.\n");
+        *out_len = (uint32_t)strlen(buffer);
+        return buffer;
+    }
+    close(output_fd);
+
+    pid = fork();
+    if (pid == 0) {
+        freopen(output_template, "w", stdout);
+        freopen(output_template, "a", stderr);
+        execlp("gcc", "gcc", source_template, "-O2", "-o", binary_path, NULL);
+        _exit(1);
+    }
+    waitpid(pid, &status, 0);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        buffer = read_text_file(output_template, out_len);
+        unlink(source_template);
+        unlink(output_template);
+        return buffer;
     }
 
-    return chosen;
-}
-
-static void release_node(int index) {
-    pthread_mutex_lock(&nodes_mutex);
-    if (index >= 0 && index < MAX_NODES && nodes[index].active) {
-        nodes[index].busy = 0;
+    pid = fork();
+    if (pid == 0) {
+        freopen(output_template, "w", stdout);
+        freopen(output_template, "a", stderr);
+        execl(binary_path, binary_path, NULL);
+        _exit(1);
     }
-    pthread_mutex_unlock(&nodes_mutex);
+    waitpid(pid, &status, 0);
+
+    buffer = read_text_file(output_template, out_len);
+
+    unlink(source_template);
+    unlink(binary_path);
+    unlink(output_template);
+    return buffer;
 }
 
 static void *client_worker(void *arg) {
     int client_fd = *(int *)arg;
     uint32_t code_len = 0;
-    char *source = NULL;
-    int node_index = -1;
-    double load = 0.0;
-    char *output = NULL;
     uint32_t output_len = 0;
+    char *source = NULL;
+    char *output = NULL;
 
     free(arg);
 
@@ -144,54 +193,26 @@ static void *client_worker(void *arg) {
         return NULL;
     }
 
-    node_index = reserve_best_node(&load);
-    if (node_index < 0) {
-        const char *message = "No lab node is currently available.\n";
-        send_string(client_fd, message, (uint32_t)strlen(message));
-        free(source);
-        close(client_fd);
-        return NULL;
-    }
-
-    pthread_mutex_lock(&nodes[node_index].lock);
-    if (send_string(nodes[node_index].socket_fd, "RUN", 3) < 0 ||
-        send_string(nodes[node_index].socket_fd, source, code_len) < 0) {
-        pthread_mutex_unlock(&nodes[node_index].lock);
-        pthread_mutex_lock(&nodes_mutex);
-        remove_node(node_index);
-        pthread_mutex_unlock(&nodes_mutex);
-        release_node(node_index);
-        free(source);
-        close(client_fd);
-        return NULL;
-    }
-
-    output = recv_string(nodes[node_index].socket_fd, &output_len);
-    pthread_mutex_unlock(&nodes[node_index].lock);
-
-    if (!output) {
-        pthread_mutex_lock(&nodes_mutex);
-        remove_node(node_index);
-        pthread_mutex_unlock(&nodes_mutex);
-        release_node(node_index);
-        free(source);
-        close(client_fd);
-        return NULL;
-    }
-
+    output = run_code(source, &output_len);
     send_string(client_fd, output, output_len);
 
-    printf("Client job sent to node %s (load %.2f)\n", nodes[node_index].name, load);
-
-    free(output);
     free(source);
-    release_node(node_index);
+    free(output);
     close(client_fd);
     return NULL;
 }
 
-static void *accept_clients(void *arg) {
-    int listen_fd = *(int *)arg;
+int main(void) {
+    int port = DEFAULT_CLIENT_PORT;
+    int listener;
+    char input[32];
+
+    prompt_text("Enter server port", input, sizeof(input), "9001");
+    port = atoi(input);
+
+    listener = create_listener(port);
+
+    printf("Server ready on port %d\n", port);
 
     while (1) {
         int *client_fd = (int *)malloc(sizeof(int));
@@ -201,7 +222,7 @@ static void *accept_clients(void *arg) {
             continue;
         }
 
-        *client_fd = accept(listen_fd, NULL, NULL);
+        *client_fd = accept(listener, NULL, NULL);
         if (*client_fd < 0) {
             free(client_fd);
             continue;
@@ -211,85 +232,5 @@ static void *accept_clients(void *arg) {
         pthread_detach(tid);
     }
 
-    return NULL;
-}
-
-static void *accept_nodes(void *arg) {
-    int listen_fd = *(int *)arg;
-
-    while (1) {
-        int node_fd = accept(listen_fd, NULL, NULL);
-        uint32_t name_len = 0;
-        char *name = NULL;
-        int slot = -1;
-
-        if (node_fd < 0) {
-            continue;
-        }
-
-        name = recv_string(node_fd, &name_len);
-        if (!name) {
-            close(node_fd);
-            continue;
-        }
-
-        pthread_mutex_lock(&nodes_mutex);
-        for (int i = 0; i < MAX_NODES; i++) {
-            if (!nodes[i].active) {
-                slot = i;
-                nodes[i].active = 1;
-                nodes[i].busy = 0;
-                nodes[i].socket_fd = node_fd;
-                snprintf(nodes[i].name, sizeof(nodes[i].name), "%s", name);
-                break;
-            }
-        }
-        pthread_mutex_unlock(&nodes_mutex);
-
-        if (slot < 0) {
-            const char *full = "Server already has 10 nodes.\n";
-            send_string(node_fd, full, (uint32_t)strlen(full));
-            close(node_fd);
-        } else {
-            printf("Node connected: %s\n", name);
-        }
-
-        free(name);
-    }
-
-    return NULL;
-}
-
-int main(void) {
-    int node_port = DEFAULT_NODE_PORT;
-    int client_port = DEFAULT_CLIENT_PORT;
-    int node_listener;
-    int client_listener;
-    pthread_t node_thread;
-    pthread_t client_thread;
-    char input[32];
-
-    prompt_text("Enter node port", input, sizeof(input), "9000");
-    node_port = atoi(input);
-
-    prompt_text("Enter client port", input, sizeof(input), "9001");
-    client_port = atoi(input);
-
-    for (int i = 0; i < MAX_NODES; i++) {
-        pthread_mutex_init(&nodes[i].lock, NULL);
-    }
-
-    node_listener = create_listener(node_port);
-    client_listener = create_listener(client_port);
-
-    printf("Server ready\n");
-    printf("Node port   : %d\n", node_port);
-    printf("Client port : %d\n", client_port);
-
-    pthread_create(&node_thread, NULL, accept_nodes, &node_listener);
-    pthread_create(&client_thread, NULL, accept_clients, &client_listener);
-
-    pthread_join(node_thread, NULL);
-    pthread_join(client_thread, NULL);
     return 0;
 }

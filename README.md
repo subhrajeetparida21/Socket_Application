@@ -1,25 +1,14 @@
-# Simple Lab Load Balancer in C
+# Simple Client Server Code Runner in C
 
-This is a small Linux-style demo with three programs:
+This version uses only two programs:
 
-- `server`: accepts lab nodes and client uploads
-- `node`: runs on each lab machine and reports its current system load
-- `client`: uploads a C file and receives the output
-
-## How it works
-
-1. Each lab machine runs `node` and connects to the central `server`.
-2. When a user runs `client`, the source file is sent to the `server`.
-3. The `server` asks all connected nodes for their current load average.
-4. The least-loaded free node is selected.
-5. The chosen node compiles the C file with `gcc`, runs it, captures the output, and sends it back.
-6. The `server` forwards the output to the client.
+- `server`: receives a C file, compiles it, runs it, and sends output back
+- `client`: sends the C file to the server and shows the output
 
 ## Build on Linux
 
 ```bash
 gcc -pthread server.c common.c -o server
-gcc node.c common.c -o node
 gcc client.c common.c -o client
 ```
 
@@ -31,68 +20,48 @@ Start the server:
 ./server
 ```
 
-It will ask:
+It asks for:
 
-- node port
-- client port
+- server port
 
-Start lab nodes on up to 10 Linux systems:
-
-```bash
-./node
-```
-
-It will ask:
-
-- server IP / hostname
-- node port
-
-Submit a C file from a client machine:
+Start the client:
 
 ```bash
 ./client
 ```
 
-It will ask:
+It asks for:
 
 - C source file path
 - server IP / hostname
 - client port
 
-## Default ports
+## Example
 
-- Node registration port: `9000`
-- Client submission port: `9001`
+Run the server and press Enter to use port `9001`.
 
-You can change them:
-
-```bash
-./server
-./node
-./client
-```
-
-## Example test file
+Create a file named `sample.c`:
 
 ```c
 #include <stdio.h>
 
 int main(void) {
-    printf("Hello from the lab node!\n");
+    printf("Hello from server side execution\n");
     return 0;
 }
 ```
 
-## Simple assumptions
+Run the client and enter:
 
-- Nodes are trusted Linux machines with `gcc` installed.
-- Only one job runs at a time on each node.
-- The server picks from currently connected free nodes only.
-- This is a teaching/demo version, so it does not sandbox user code.
+- `sample.c`
+- `127.0.0.1`
+- `9001`
 
-## Suggested improvement ideas
+The client will print the output returned by the server.
 
-- Add execution timeout so infinite loops do not hang a node.
-- Add security sandboxing with `chroot`, containers, or restricted users.
-- Send compiler errors back in detail instead of a generic message.
-- Store job history and node status in logs.
+## Notes
+
+- This is a simple teaching demo.
+- The server compiles with `gcc`, so Linux should have `gcc` installed.
+- The server executes the uploaded code locally.
+- There is no sandbox or timeout in this simple version.
