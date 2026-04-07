@@ -3,7 +3,7 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
-#include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -13,15 +13,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define MAX_CLIENTS 32
-#define START_PORT  9001
-#define MAX_PORT    9100
-
 typedef struct {
     int fd;
     char ip[INET_ADDRSTRLEN];
-    int active;            /* 1 = connected */
-    uint32_t load;         /* cached load */
+    int active;
+    uint32_t load;
 } Client;
 
 typedef struct {
@@ -30,7 +26,7 @@ typedef struct {
     char ip[INET_ADDRSTRLEN];
 } ActiveClient;
 
-static Client g_clients[MAX_CLIENTS];
+static Client g_clients[MAX_NODES];
 static int g_client_count = 0;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -38,7 +34,7 @@ static void get_local_ip(char *buf, size_t size) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     if (s < 0) {
         strncpy(buf, "127.0.0.1", size);
-        buf[size - 1] = '\0';
+        if (size > 0) buf[size - 1] = '\0';
         return;
     }
 
@@ -51,7 +47,7 @@ static void get_local_ip(char *buf, size_t size) {
     if (connect(s, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
         close(s);
         strncpy(buf, "127.0.0.1", size);
-        buf[size - 1] = '\0';
+        if (size > 0) buf[size - 1] = '\0';
         return;
     }
 
@@ -60,6 +56,32 @@ static void get_local_ip(char *buf, size_t size) {
     getsockname(s, (struct sockaddr *)&local, &len);
     close(s);
     inet_ntop(AF_INET, &local.sin_addr, buf, size);
+}
+
+static int create_listener(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (listen(fd, 16) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 static int list_c_files(char files[][256], int max) {
@@ -100,8 +122,7 @@ static char *read_file(const char *path, uint32_t *out_len) {
         return NULL;
     }
 
-    size_t nr = fread(buf, 1, (size_t)sz, fp);
-    (void)nr;
+    fread(buf, 1, (size_t)sz, fp);
     buf[sz] = '\0';
     fclose(fp);
 
@@ -119,7 +140,7 @@ static void *acceptor(void *arg) {
         if (cfd < 0) continue;
 
         pthread_mutex_lock(&g_mutex);
-        if (g_client_count >= MAX_CLIENTS) {
+        if (g_client_count >= MAX_NODES) {
             pthread_mutex_unlock(&g_mutex);
             close(cfd);
             continue;
@@ -131,7 +152,7 @@ static void *acceptor(void *arg) {
         c->load = 0;
         inet_ntop(AF_INET, &addr.sin_addr, c->ip, sizeof(c->ip));
 
-        printf("\n[server] Client connected: %s  (total: %d)\n> ",
+        printf("\n[server] Node connected: %s  (total: %d)\n> ",
                c->ip, g_client_count);
         fflush(stdout);
 
@@ -174,8 +195,8 @@ static int query_client_load(int fd, uint32_t *load) {
 }
 
 static int choose_least_loaded_client(uint32_t *load_out) {
-    ActiveClient active[MAX_CLIENTS];
-    int n = snapshot_active_clients(active, MAX_CLIENTS);
+    ActiveClient active[MAX_NODES];
+    int n = snapshot_active_clients(active, MAX_NODES);
 
     int best_idx = -1;
     uint32_t best_load = UINT32_MAX;
@@ -219,44 +240,26 @@ static void decrement_load(int idx) {
     pthread_mutex_unlock(&g_mutex);
 }
 
+static int send_job_to_client(int fd, const char *source, uint32_t src_len,
+                              char **out_text, uint32_t *out_len) {
+    if (send_u8(fd, MSG_RUN_CODE) < 0) return -1;
+    if (send_string(fd, source, src_len) < 0) return -1;
+    *out_text = recv_string(fd, out_len);
+    return (*out_text != NULL) ? 0 : -1;
+}
+
 int main(void) {
     char myip[INET_ADDRSTRLEN];
     get_local_ip(myip, sizeof(myip));
 
-    int listener = -1;
-    int port = START_PORT;
-
-    for (; port <= MAX_PORT; port++) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) continue;
-
-        int opt = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
-
-        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-            if (listen(fd, 16) == 0) {
-                listener = fd;
-                break;
-            }
-        }
-
-        close(fd);
-    }
-
+    int listener = create_listener(DEFAULT_LB_PORT);
     if (listener < 0) {
-        fprintf(stderr, "[server] No available port in range %d-%d.\n", START_PORT, MAX_PORT);
+        perror("[server] listener");
         return 1;
     }
 
-    printf("[server] Listening on %s:%d\n", myip, port);
-    printf("[server] Tell lab systems to connect to this IP and port.\n");
-    printf("[server] Waiting for clients to join...\n\n");
+    printf("[server] Listening on %s:%d\n", myip, DEFAULT_LB_PORT);
+    printf("[server] Waiting for lab systems to connect...\n\n");
 
     pthread_t atid;
     pthread_create(&atid, NULL, acceptor, &listener);
@@ -266,13 +269,13 @@ int main(void) {
     char input[64];
 
     while (1) {
-        printf("> Press ENTER to assign a job, or type 'list' to see clients\n");
+        printf("> Press ENTER to assign a job, or type 'list' to see nodes\n");
         if (!fgets(input, sizeof(input), stdin)) break;
         input[strcspn(input, "\n")] = '\0';
 
         if (strcmp(input, "list") == 0) {
             pthread_mutex_lock(&g_mutex);
-            printf("  Connected clients:\n");
+            printf("[server] Connected nodes:\n");
             for (int i = 0; i < g_client_count; i++) {
                 if (g_clients[i].active) {
                     printf("  [%d] %s  (load: %u)\n", i + 1, g_clients[i].ip, g_clients[i].load);
@@ -303,18 +306,17 @@ int main(void) {
             continue;
         }
 
-        char *chosen = files[choice - 1];
         uint32_t src_len = 0;
-        char *source = read_file(chosen, &src_len);
+        char *source = read_file(files[choice - 1], &src_len);
         if (!source) {
-            printf("[server] Could not read %s\n", chosen);
+            printf("[server] Could not read %s\n", files[choice - 1]);
             continue;
         }
 
         uint32_t selected_load = 0;
         int best = choose_least_loaded_client(&selected_load);
         if (best < 0) {
-            printf("[server] No active clients available.\n");
+            printf("[server] No active nodes available.\n");
             free(source);
             continue;
         }
@@ -326,34 +328,30 @@ int main(void) {
         ip[sizeof(ip) - 1] = '\0';
         pthread_mutex_unlock(&g_mutex);
 
-        printf("[server] Sending '%s' to least loaded client %s (load=%u)\n",
-               chosen, ip, selected_load);
+        printf("[server] Sending '%s' to least loaded node %s (load=%u)\n",
+               files[choice - 1], ip, selected_load);
 
-        if (send_u8(fd, MSG_RUN_CODE) < 0 || send_string(fd, source, src_len) < 0) {
-            printf("[server] Failed to send job to %s\n", ip);
+        increment_load(best);
+
+        char *output = NULL;
+        uint32_t out_len = 0;
+
+        if (send_job_to_client(fd, source, src_len, &output, &out_len) < 0) {
+            printf("[server] Failed to get response from %s\n", ip);
+            decrement_load(best);
             mark_client_dead(best);
             free(source);
             continue;
         }
 
-        increment_load(best);
-
-        uint32_t out_len = 0;
-        char *output = recv_string(fd, &out_len);
-
         decrement_load(best);
 
-        if (!output) {
-            printf("──── Output from %s ────\n(no response / disconnected)\n\n", ip);
-            mark_client_dead(best);
-        } else {
-            printf("──── Output from %s ────\n", ip);
-            printf("%s", output);
-            if (out_len == 0 || output[out_len - 1] != '\n') printf("\n");
-            printf("\n");
-            free(output);
-        }
+        printf("──── Output from %s ────\n", ip);
+        printf("%s", output);
+        if (out_len == 0 || output[out_len - 1] != '\n') printf("\n");
+        printf("\n");
 
+        free(output);
         free(source);
     }
 
