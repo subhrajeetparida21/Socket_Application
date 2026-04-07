@@ -169,41 +169,48 @@ static char *run_code(const char *source_code, uint32_t *out_len) {
     return result;
 }
 
+static int connect_to_server(const char *host, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    struct hostent *he = gethostbyname(host);
+    if (!he) {
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    memcpy(&addr.sin_addr.s_addr, he->h_addr, he->h_length);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
 int main(void) {
     char server_ip[128];
     char port_str[16];
-    int port;
+    int port = DEFAULT_LB_PORT;
 
     printf("Enter server IP address: ");
     fflush(stdout);
     if (!fgets(server_ip, sizeof(server_ip), stdin)) return 1;
     server_ip[strcspn(server_ip, "\n")] = '\0';
 
-    printf("Enter server port [9001]: ");
+    printf("Enter server port [%d]: ", DEFAULT_LB_PORT);
     fflush(stdout);
     if (!fgets(port_str, sizeof(port_str), stdin)) return 1;
     port_str[strcspn(port_str, "\n")] = '\0';
-    port = (port_str[0] != '\0') ? atoi(port_str) : 9001;
+    if (port_str[0] != '\0') port = atoi(port_str);
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = connect_to_server(server_ip, port);
     if (fd < 0) {
-        perror("socket");
-        return 1;
-    }
-
-    struct hostent *he = gethostbyname(server_ip);
-    if (!he) {
-        fprintf(stderr, "Cannot resolve %s\n", server_ip);
-        return 1;
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    memcpy(&addr.sin_addr.s_addr, he->h_addr, he->h_length);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("connect");
         fprintf(stderr, "Could not connect to %s:%d\n", server_ip, port);
         return 1;
@@ -214,7 +221,7 @@ int main(void) {
     fflush(stdout);
 
     while (1) {
-        uint8_t msg;
+        uint8_t msg = 0;
         if (recv_u8(fd, &msg) < 0) {
             printf("\n[client] Server disconnected. Exiting.\n");
             break;
@@ -230,17 +237,16 @@ int main(void) {
             char *source = recv_string(fd, &src_len);
             if (!source) break;
 
-            printf("[client] Received job (%u bytes) — running C code...\n", src_len);
+            printf("[client] Received job (%u bytes) — compiling and running...\n", src_len);
             fflush(stdout);
 
             inc_jobs();
-            char *output = run_code(source, &src_len);
+            uint32_t out_len = 0;
+            char *output = run_code(source, &out_len);
             dec_jobs();
 
-            uint32_t out_len = (uint32_t)strlen(output);
-
             if (send_string(fd, output, out_len) < 0) {
-                printf("[client] Failed to send output. Server may have disconnected.\n");
+                printf("[client] Failed to send output.\n");
                 free(source);
                 free(output);
                 break;
