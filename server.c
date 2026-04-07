@@ -1,23 +1,11 @@
-/*
- * server.c — Code Distribution Server
- *
- * Compile:  gcc server.c -o server -lpthread
- * Run:      ./server
- *
- * - Auto-detects your IP
- * - Finds an available port starting from 9001
- * - Accepts multiple client (lab machine) connections
- * - Prompts you to pick a .c file from the current folder
- * - Sends it to ALL connected clients at once, collects and prints their output
- */
-
 #define _GNU_SOURCE
+#include "common.h"
+
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,84 +13,105 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* ── constants ──────────────────────────────────────────────────────── */
-#define MAX_CLIENTS   32
-#define START_PORT    9001
-#define MAX_PORT      9100
+#define MAX_CLIENTS 32
+#define START_PORT  9001
+#define MAX_PORT    9100
 
-/* ── network helpers ─────────────────────────────────────────────────── */
-static int send_all(int fd, const void *buf, int len) {
-    const char *p = (const char *)buf;
-    int sent = 0;
-    while (sent < len) {
-        int n = send(fd, p + sent, len - sent, 0);
-        if (n <= 0) return -1;
-        sent += n;
+typedef struct {
+    int fd;
+    char ip[INET_ADDRSTRLEN];
+    int active;            /* 1 = connected */
+    uint32_t load;         /* cached load */
+} Client;
+
+typedef struct {
+    int idx;
+    int fd;
+    char ip[INET_ADDRSTRLEN];
+} ActiveClient;
+
+static Client g_clients[MAX_CLIENTS];
+static int g_client_count = 0;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void get_local_ip(char *buf, size_t size) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) {
+        strncpy(buf, "127.0.0.1", size);
+        buf[size - 1] = '\0';
+        return;
     }
-    return 0;
-}
 
-static int recv_all(int fd, void *buf, int len) {
-    char *p = (char *)buf;
-    int got = 0;
-    while (got < len) {
-        int n = recv(fd, p + got, len - got, 0);
-        if (n <= 0) return -1;
-        got += n;
+    struct sockaddr_in remote;
+    memset(&remote, 0, sizeof(remote));
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(80);
+    inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
+
+    if (connect(s, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+        close(s);
+        strncpy(buf, "127.0.0.1", size);
+        buf[size - 1] = '\0';
+        return;
     }
-    return 0;
+
+    struct sockaddr_in local;
+    socklen_t len = sizeof(local);
+    getsockname(s, (struct sockaddr *)&local, &len);
+    close(s);
+    inet_ntop(AF_INET, &local.sin_addr, buf, size);
 }
 
-static int send_str(int fd, const char *s, uint32_t len) {
-    uint32_t net = htonl(len);
-    if (send_all(fd, &net, 4) < 0) return -1;
-    if (len > 0 && send_all(fd, s, (int)len) < 0) return -1;
-    return 0;
+static int list_c_files(char files[][256], int max) {
+    DIR *d = opendir(".");
+    int count = 0;
+    if (!d) return 0;
+
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && count < max) {
+        size_t n = strlen(e->d_name);
+        if (n > 2 && strcmp(e->d_name + n - 2, ".c") == 0) {
+            strncpy(files[count], e->d_name, 255);
+            files[count][255] = '\0';
+            count++;
+        }
+    }
+
+    closedir(d);
+    return count;
 }
 
-static char *recv_str(int fd, uint32_t *out_len) {
-    uint32_t net = 0;
-    if (recv_all(fd, &net, 4) < 0) return NULL;
-    uint32_t len = ntohl(net);
-    char *buf = (char *)malloc(len + 1);
-    if (!buf) return NULL;
-    if (len > 0 && recv_all(fd, buf, (int)len) < 0) { free(buf); return NULL; }
-    buf[len] = '\0';
-    if (out_len) *out_len = len;
+static char *read_file(const char *path, uint32_t *out_len) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
+
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (sz < 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+
+    size_t nr = fread(buf, 1, (size_t)sz, fp);
+    (void)nr;
+    buf[sz] = '\0';
+    fclose(fp);
+
+    *out_len = (uint32_t)sz;
     return buf;
 }
 
-/* ── client registry ─────────────────────────────────────────────────── */
-typedef struct {
-    int  fd;
-    char ip[INET_ADDRSTRLEN];
-    int  active;           /* 1 = connected */
-} Client;
-
-static Client       g_clients[MAX_CLIENTS];
-static int          g_client_count = 0;
-static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/* ── per-client accept thread: just detects disconnection ─────────────── */
-static void *watch_client(void *arg) {
-    Client *c = (Client *)arg;
-    /* Block waiting — if client disconnects recv returns 0 */
-    char tmp[4];
-    while (recv(c->fd, tmp, sizeof(tmp), MSG_PEEK) > 0) {
-        sleep(1);
-    }
-    pthread_mutex_lock(&g_mutex);
-    c->active = 0;
-    close(c->fd);
-    printf("\n[server] Client %s disconnected.\n> ", c->ip);
-    fflush(stdout);
-    pthread_mutex_unlock(&g_mutex);
-    return NULL;
-}
-
-/* ── acceptor thread ─────────────────────────────────────────────────── */
 static void *acceptor(void *arg) {
     int listener = *(int *)arg;
+
     while (1) {
         struct sockaddr_in addr;
         socklen_t addrlen = sizeof(addr);
@@ -115,167 +124,164 @@ static void *acceptor(void *arg) {
             close(cfd);
             continue;
         }
-        Client *c  = &g_clients[g_client_count++];
-        c->fd      = cfd;
-        c->active  = 1;
+
+        Client *c = &g_clients[g_client_count++];
+        c->fd = cfd;
+        c->active = 1;
+        c->load = 0;
         inet_ntop(AF_INET, &addr.sin_addr, c->ip, sizeof(c->ip));
+
         printf("\n[server] Client connected: %s  (total: %d)\n> ",
                c->ip, g_client_count);
         fflush(stdout);
+
+        pthread_mutex_unlock(&g_mutex);
+    }
+
+    return NULL;
+}
+
+static int snapshot_active_clients(ActiveClient *out, int max) {
+    int n = 0;
+
+    pthread_mutex_lock(&g_mutex);
+    for (int i = 0; i < g_client_count && n < max; i++) {
+        if (!g_clients[i].active) continue;
+        out[n].idx = i;
+        out[n].fd = g_clients[i].fd;
+        strncpy(out[n].ip, g_clients[i].ip, INET_ADDRSTRLEN - 1);
+        out[n].ip[INET_ADDRSTRLEN - 1] = '\0';
+        n++;
+    }
+    pthread_mutex_unlock(&g_mutex);
+
+    return n;
+}
+
+static void mark_client_dead(int idx) {
+    pthread_mutex_lock(&g_mutex);
+    if (idx >= 0 && idx < g_client_count && g_clients[idx].active) {
+        g_clients[idx].active = 0;
+        close(g_clients[idx].fd);
+    }
+    pthread_mutex_unlock(&g_mutex);
+}
+
+static int query_client_load(int fd, uint32_t *load) {
+    if (send_u8(fd, MSG_QUERY_LOAD) < 0) return -1;
+    if (recv_u32(fd, load) < 0) return -1;
+    return 0;
+}
+
+static int choose_least_loaded_client(uint32_t *load_out) {
+    ActiveClient active[MAX_CLIENTS];
+    int n = snapshot_active_clients(active, MAX_CLIENTS);
+
+    int best_idx = -1;
+    uint32_t best_load = UINT32_MAX;
+
+    for (int i = 0; i < n; i++) {
+        uint32_t load = 0;
+        if (query_client_load(active[i].fd, &load) < 0) {
+            mark_client_dead(active[i].idx);
+            continue;
+        }
+
+        pthread_mutex_lock(&g_mutex);
+        if (active[i].idx >= 0 && active[i].idx < g_client_count) {
+            g_clients[active[i].idx].load = load;
+        }
         pthread_mutex_unlock(&g_mutex);
 
-        pthread_t tid;
-        pthread_create(&tid, NULL, watch_client, c);
-        pthread_detach(tid);
-    }
-    return NULL;
-}
-
-/* ── get outbound IP ─────────────────────────────────────────────────── */
-static void get_local_ip(char *buf, size_t size) {
-    int s = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in remote;
-    memset(&remote, 0, sizeof(remote));
-    remote.sin_family      = AF_INET;
-    remote.sin_port        = htons(80);
-    inet_pton(AF_INET, "8.8.8.8", &remote.sin_addr);
-    connect(s, (struct sockaddr *)&remote, sizeof(remote));
-    struct sockaddr_in local;
-    socklen_t len = sizeof(local);
-    getsockname(s, (struct sockaddr *)&local, &len);
-    close(s);
-    inet_ntop(AF_INET, &local.sin_addr, buf, size);
-}
-
-/* ── list .c files in current directory ──────────────────────────────── */
-static int list_c_files(char files[][256], int max) {
-    DIR *d = opendir(".");
-    int count = 0;
-    if (!d) return 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL && count < max) {
-        size_t n = strlen(e->d_name);
-        if (n > 2 && strcmp(e->d_name + n - 2, ".c") == 0) {
-            strncpy(files[count], e->d_name, 255);
-            files[count][255] = '\0';
-            count++;
+        if (load < best_load) {
+            best_load = load;
+            best_idx = active[i].idx;
         }
     }
-    closedir(d);
-    return count;
+
+    if (load_out) *load_out = best_load;
+    return best_idx;
 }
 
-/* ── read a file into a malloc'd buffer ──────────────────────────────── */
-static char *read_file(const char *path, uint32_t *out_len) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz < 0) { fclose(fp); return NULL; }
-    char *buf = (char *)malloc((size_t)sz + 1);
-    if (!buf) { fclose(fp); return NULL; }
-    size_t nr = fread(buf, 1, (size_t)sz, fp); (void)nr;
-    buf[sz] = '\0';
-    fclose(fp);
-    *out_len = (uint32_t)sz;
-    return buf;
+static void increment_load(int idx) {
+    pthread_mutex_lock(&g_mutex);
+    if (idx >= 0 && idx < g_client_count && g_clients[idx].active) {
+        g_clients[idx].load++;
+    }
+    pthread_mutex_unlock(&g_mutex);
 }
 
-/* ── per-client job thread: send code, collect output ────────────────── */
-typedef struct {
-    int      fd;
-    char     ip[INET_ADDRSTRLEN];
-    char    *source;
-    uint32_t src_len;
-    char    *output;       /* filled in by thread */
-    uint32_t out_len;
-    int      ok;
-} JobArg;
-
-static void *send_job(void *arg) {
-    JobArg *j = (JobArg *)arg;
-    if (send_str(j->fd, j->source, j->src_len) < 0) { j->ok = 0; return NULL; }
-    j->output = recv_str(j->fd, &j->out_len);
-    j->ok     = (j->output != NULL);
-    return NULL;
+static void decrement_load(int idx) {
+    pthread_mutex_lock(&g_mutex);
+    if (idx >= 0 && idx < g_client_count && g_clients[idx].active && g_clients[idx].load > 0) {
+        g_clients[idx].load--;
+    }
+    pthread_mutex_unlock(&g_mutex);
 }
 
-/* ── main ───────────────────────────────────────────────────────────── */
 int main(void) {
     char myip[INET_ADDRSTRLEN];
     get_local_ip(myip, sizeof(myip));
 
-    /* Find an available port */
-    int listener = -1, port = START_PORT;
+    int listener = -1;
+    int port = START_PORT;
+
     for (; port <= MAX_PORT; port++) {
-        int fd  = socket(AF_INET, SOCK_STREAM, 0);
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) continue;
+
         int opt = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
-        addr.sin_family      = AF_INET;
+        addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port        = htons(port);
+        addr.sin_port = htons(port);
 
         if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-            listen(fd, 16);
-            listener = fd;
-            break;
+            if (listen(fd, 16) == 0) {
+                listener = fd;
+                break;
+            }
         }
-        printf("[server] Port %d is in use, trying %d...\n", port, port + 1);
+
         close(fd);
     }
 
     if (listener < 0) {
-        fprintf(stderr, "[server] No available port in range %d-%d.\n",
-                START_PORT, MAX_PORT);
+        fprintf(stderr, "[server] No available port in range %d-%d.\n", START_PORT, MAX_PORT);
         return 1;
     }
 
-    printf("[server] Listening on  %s : %d\n", myip, port);
-    printf("[server] Tell clients to connect to this IP and port.\n");
+    printf("[server] Listening on %s:%d\n", myip, port);
+    printf("[server] Tell lab systems to connect to this IP and port.\n");
     printf("[server] Waiting for clients to join...\n\n");
 
-    /* Start acceptor thread */
     pthread_t atid;
     pthread_create(&atid, NULL, acceptor, &listener);
     pthread_detach(atid);
 
-    /* Main loop: pick a file, distribute to all clients */
     char files[64][256];
     char input[64];
 
     while (1) {
-        printf("> Press ENTER to distribute a job (or type 'list' to see clients)\n");
+        printf("> Press ENTER to assign a job, or type 'list' to see clients\n");
         if (!fgets(input, sizeof(input), stdin)) break;
         input[strcspn(input, "\n")] = '\0';
 
         if (strcmp(input, "list") == 0) {
             pthread_mutex_lock(&g_mutex);
-            printf("  Connected clients: %d\n", g_client_count);
+            printf("  Connected clients:\n");
             for (int i = 0; i < g_client_count; i++) {
-                if (g_clients[i].active)
-                    printf("  [%d] %s\n", i + 1, g_clients[i].ip);
+                if (g_clients[i].active) {
+                    printf("  [%d] %s  (load: %u)\n", i + 1, g_clients[i].ip, g_clients[i].load);
+                }
             }
             pthread_mutex_unlock(&g_mutex);
             continue;
         }
 
-        /* Count active clients */
-        pthread_mutex_lock(&g_mutex);
-        int active = 0;
-        for (int i = 0; i < g_client_count; i++)
-            if (g_clients[i].active) active++;
-        pthread_mutex_unlock(&g_mutex);
-
-        if (active == 0) {
-            printf("[server] No clients connected yet. Still waiting...\n");
-            continue;
-        }
-
-        /* List .c files */
         int nfiles = list_c_files(files, 64);
         if (nfiles == 0) {
             printf("[server] No .c files found in the current directory.\n");
@@ -283,8 +289,10 @@ int main(void) {
         }
 
         printf("\nC files in current directory:\n");
-        for (int i = 0; i < nfiles; i++)
+        for (int i = 0; i < nfiles; i++) {
             printf("  [%d] %s\n", i + 1, files[i]);
+        }
+
         printf("Pick a file (1-%d): ", nfiles);
         fflush(stdout);
 
@@ -303,46 +311,52 @@ int main(void) {
             continue;
         }
 
-        printf("[server] Sending '%s' to %d client(s)...\n\n", chosen, active);
-
-        /* Spawn a thread per active client */
-        pthread_mutex_lock(&g_mutex);
-        JobArg *jobs     = (JobArg *)calloc(g_client_count, sizeof(JobArg));
-        pthread_t *tids  = (pthread_t *)calloc(g_client_count, sizeof(pthread_t));
-        int dispatched   = 0;
-
-        for (int i = 0; i < g_client_count; i++) {
-            if (!g_clients[i].active) continue;
-            jobs[dispatched].fd      = g_clients[i].fd;
-            strncpy(jobs[dispatched].ip, g_clients[i].ip, INET_ADDRSTRLEN - 1);
-            jobs[dispatched].source  = source;
-            jobs[dispatched].src_len = src_len;
-            jobs[dispatched].output  = NULL;
-            jobs[dispatched].ok      = 0;
-            pthread_create(&tids[dispatched], NULL, send_job, &jobs[dispatched]);
-            dispatched++;
+        uint32_t selected_load = 0;
+        int best = choose_least_loaded_client(&selected_load);
+        if (best < 0) {
+            printf("[server] No active clients available.\n");
+            free(source);
+            continue;
         }
+
+        pthread_mutex_lock(&g_mutex);
+        int fd = g_clients[best].fd;
+        char ip[INET_ADDRSTRLEN];
+        strncpy(ip, g_clients[best].ip, sizeof(ip) - 1);
+        ip[sizeof(ip) - 1] = '\0';
         pthread_mutex_unlock(&g_mutex);
 
-        /* Wait for all threads */
-        for (int i = 0; i < dispatched; i++)
-            pthread_join(tids[i], NULL);
+        printf("[server] Sending '%s' to least loaded client %s (load=%u)\n",
+               chosen, ip, selected_load);
 
-        /* Print results */
-        for (int i = 0; i < dispatched; i++) {
-            printf("──── Output from %s ────\n", jobs[i].ip);
-            if (jobs[i].ok && jobs[i].output)
-                printf("%s", jobs[i].output);
-            else
-                printf("(no response / disconnected)\n");
-            printf("\n");
-            free(jobs[i].output);
+        if (send_u8(fd, MSG_RUN_CODE) < 0 || send_string(fd, source, src_len) < 0) {
+            printf("[server] Failed to send job to %s\n", ip);
+            mark_client_dead(best);
+            free(source);
+            continue;
         }
 
-        free(jobs);
-        free(tids);
+        increment_load(best);
+
+        uint32_t out_len = 0;
+        char *output = recv_string(fd, &out_len);
+
+        decrement_load(best);
+
+        if (!output) {
+            printf("──── Output from %s ────\n(no response / disconnected)\n\n", ip);
+            mark_client_dead(best);
+        } else {
+            printf("──── Output from %s ────\n", ip);
+            printf("%s", output);
+            if (out_len == 0 || output[out_len - 1] != '\n') printf("\n");
+            printf("\n");
+            free(output);
+        }
+
         free(source);
     }
 
+    close(listener);
     return 0;
 }
