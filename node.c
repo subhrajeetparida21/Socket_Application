@@ -2,11 +2,13 @@
 #include "common.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +16,9 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#define COMPILE_TIMEOUT_SEC 20
+#define RUN_TIMEOUT_SEC 5
 
 static pthread_mutex_t g_load_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_active_jobs = 0;
@@ -38,12 +43,17 @@ static uint32_t get_jobs(void) {
     return v;
 }
 
-static int write_all(int fd, const void *buf, size_t len) {
+static int write_all_fd(int fd, const void *buf, size_t len) {
     const char *p = (const char *)buf;
     size_t sent = 0;
+
     while (sent < len) {
         ssize_t n = write(fd, p + sent, len - sent);
-        if (n <= 0) return -1;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
         sent += (size_t)n;
     }
     return 0;
@@ -57,11 +67,22 @@ static char *read_text_file(const char *path, uint32_t *out_len) {
         return msg;
     }
 
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        char *msg = strdup("Failed to read output file.\n");
+        *out_len = (uint32_t)strlen(msg);
+        return msg;
+    }
 
+    long size = ftell(fp);
     if (size < 0) {
+        fclose(fp);
+        char *msg = strdup("Failed to read output file.\n");
+        *out_len = (uint32_t)strlen(msg);
+        return msg;
+    }
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
         fclose(fp);
         char *msg = strdup("Failed to read output file.\n");
         *out_len = (uint32_t)strlen(msg);
@@ -76,9 +97,16 @@ static char *read_text_file(const char *path, uint32_t *out_len) {
         return msg;
     }
 
-    if (size > 0) fread(buf, 1, (size_t)size, fp);
-    buf[size] = '\0';
+    size_t got = 0;
+    if (size > 0) got = fread(buf, 1, (size_t)size, fp);
     fclose(fp);
+
+    if (got != (size_t)size) {
+        free(buf);
+        char *msg = strdup("Failed to read output file.\n");
+        *out_len = (uint32_t)strlen(msg);
+        return msg;
+    }
 
     if (size == 0) {
         free(buf);
@@ -87,11 +115,34 @@ static char *read_text_file(const char *path, uint32_t *out_len) {
         return msg;
     }
 
+    buf[size] = '\0';
     *out_len = (uint32_t)size;
     return buf;
 }
 
-static char *run_code(const char *source_code, uint32_t *out_len) {
+static int wait_with_timeout(pid_t pid, int timeout_sec, int *status) {
+    int waited = 0;
+
+    while (1) {
+        pid_t r = waitpid(pid, status, WNOHANG);
+        if (r == pid) return 0;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+
+        if (waited >= timeout_sec * 10) {
+            kill(pid, SIGKILL);
+            if (waitpid(pid, status, 0) < 0) return -1;
+            return 1;
+        }
+
+        usleep(100000);
+        waited++;
+    }
+}
+
+static char *run_code(const char *source_code, uint32_t src_len, uint32_t *out_len) {
     char source_tpl[] = "/tmp/lab_src_XXXXXX.c";
     char output_tpl[] = "/tmp/lab_out_XXXXXX.txt";
     char binary_path[PATH_MAX];
@@ -103,7 +154,7 @@ static char *run_code(const char *source_code, uint32_t *out_len) {
         return msg;
     }
 
-    if (write_all(source_fd, source_code, strlen(source_code)) < 0) {
+    if (write_all_fd(source_fd, source_code, src_len) < 0) {
         close(source_fd);
         unlink(source_tpl);
         char *msg = strdup("Failed to write temp source file.\n");
@@ -124,7 +175,15 @@ static char *run_code(const char *source_code, uint32_t *out_len) {
     close(output_fd);
 
     pid_t pid = fork();
-    int status;
+    int status = 0;
+
+    if (pid < 0) {
+        unlink(source_tpl);
+        unlink(output_tpl);
+        char *msg = strdup("Failed to fork for compilation.\n");
+        *out_len = (uint32_t)strlen(msg);
+        return msg;
+    }
 
     if (pid == 0) {
         int ofd = open(output_tpl, O_WRONLY | O_TRUNC);
@@ -137,9 +196,8 @@ static char *run_code(const char *source_code, uint32_t *out_len) {
         _exit(1);
     }
 
-    waitpid(pid, &status, 0);
-
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    int compile_wait = wait_with_timeout(pid, COMPILE_TIMEOUT_SEC, &status);
+    if (compile_wait < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         char *err = read_text_file(output_tpl, out_len);
         unlink(source_tpl);
         unlink(output_tpl);
@@ -147,6 +205,15 @@ static char *run_code(const char *source_code, uint32_t *out_len) {
     }
 
     pid = fork();
+    if (pid < 0) {
+        unlink(source_tpl);
+        unlink(binary_path);
+        unlink(output_tpl);
+        char *msg = strdup("Failed to fork for execution.\n");
+        *out_len = (uint32_t)strlen(msg);
+        return msg;
+    }
+
     if (pid == 0) {
         int ofd = open(output_tpl, O_WRONLY | O_TRUNC);
         if (ofd >= 0) {
@@ -158,9 +225,18 @@ static char *run_code(const char *source_code, uint32_t *out_len) {
         _exit(1);
     }
 
-    waitpid(pid, &status, 0);
+    int run_wait = wait_with_timeout(pid, RUN_TIMEOUT_SEC, &status);
 
-    char *result = read_text_file(output_tpl, out_len);
+    char *result = NULL;
+    if (run_wait == 1) {
+        result = strdup("Runtime timeout.\n");
+        *out_len = (uint32_t)strlen(result);
+    } else if (run_wait < 0 || !WIFEXITED(status)) {
+        result = strdup("Runtime error.\n");
+        *out_len = (uint32_t)strlen(result);
+    } else {
+        result = read_text_file(output_tpl, out_len);
+    }
 
     unlink(source_tpl);
     unlink(binary_path);
@@ -183,7 +259,7 @@ static int connect_to_server(const char *host, int port) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    memcpy(&addr.sin_addr.s_addr, he->h_addr, he->h_length);
+    memcpy(&addr.sin_addr.s_addr, he->h_addr, (size_t)he->h_length);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);
@@ -242,8 +318,13 @@ int main(void) {
 
             inc_jobs();
             uint32_t out_len = 0;
-            char *output = run_code(source, &out_len);
+            char *output = run_code(source, src_len, &out_len);
             dec_jobs();
+
+            if (!output) {
+                free(source);
+                break;
+            }
 
             if (send_string(fd, output, out_len) < 0) {
                 printf("[node] Failed to send output.\n");
