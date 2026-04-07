@@ -53,7 +53,13 @@ static void get_local_ip(char *buf, size_t size) {
 
     struct sockaddr_in local;
     socklen_t len = sizeof(local);
-    getsockname(s, (struct sockaddr *)&local, &len);
+    if (getsockname(s, (struct sockaddr *)&local, &len) < 0) {
+        close(s);
+        strncpy(buf, "127.0.0.1", size);
+        if (size > 0) buf[size - 1] = '\0';
+        return;
+    }
+
     close(s);
     inet_ntop(AF_INET, &local.sin_addr, buf, size);
 }
@@ -107,11 +113,18 @@ static char *read_file(const char *path, uint32_t *out_len) {
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
 
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
 
+    long sz = ftell(fp);
     if (sz < 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
         fclose(fp);
         return NULL;
     }
@@ -122,10 +135,15 @@ static char *read_file(const char *path, uint32_t *out_len) {
         return NULL;
     }
 
-    fread(buf, 1, (size_t)sz, fp);
-    buf[sz] = '\0';
+    size_t got = fread(buf, 1, (size_t)sz, fp);
     fclose(fp);
 
+    if (got != (size_t)sz) {
+        free(buf);
+        return NULL;
+    }
+
+    buf[sz] = '\0';
     *out_len = (uint32_t)sz;
     return buf;
 }
@@ -220,7 +238,12 @@ static int choose_least_loaded_client(uint32_t *load_out) {
         }
     }
 
-    if (load_out) *load_out = best_load;
+    if (best_idx < 0 && load_out) {
+        *load_out = 0;
+    } else if (load_out) {
+        *load_out = best_load;
+    }
+
     return best_idx;
 }
 
@@ -262,7 +285,11 @@ int main(void) {
     printf("[server] Waiting for lab systems to connect...\n\n");
 
     pthread_t atid;
-    pthread_create(&atid, NULL, acceptor, &listener);
+    if (pthread_create(&atid, NULL, acceptor, &listener) != 0) {
+        perror("[server] pthread_create");
+        close(listener);
+        return 1;
+    }
     pthread_detach(atid);
 
     char files[64][256];
@@ -278,7 +305,8 @@ int main(void) {
             printf("[server] Connected nodes:\n");
             for (int i = 0; i < g_client_count; i++) {
                 if (g_clients[i].active) {
-                    printf("  [%d] %s  (load: %u)\n", i + 1, g_clients[i].ip, g_clients[i].load);
+                    printf("  [%d] %s  (load: %u)\n",
+                           i + 1, g_clients[i].ip, g_clients[i].load);
                 }
             }
             pthread_mutex_unlock(&g_mutex);
@@ -341,6 +369,7 @@ int main(void) {
             decrement_load(best);
             mark_client_dead(best);
             free(source);
+            if (output) free(output);
             continue;
         }
 
