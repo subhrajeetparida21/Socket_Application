@@ -13,10 +13,16 @@
 
 int    send_all(int fd, const void *buf, int len);
 int    recv_all(int fd, void *buf, int len);
+
+int    send_u8(int fd, uint8_t value);
+int    recv_u8(int fd, uint8_t *value);
+
 int    send_u32(int fd, uint32_t value);
 int    recv_u32(int fd, uint32_t *value);
+
 int    send_double(int fd, double value);
 int    recv_double(int fd, double *value);
+
 int    send_string(int fd, const char *text, uint32_t len);
 char  *recv_string(int fd, uint32_t *out_len);
 
