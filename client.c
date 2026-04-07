@@ -186,7 +186,10 @@ int main(void) {
     port = (port_str[0] != '\0') ? atoi(port_str) : 9001;
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket"); return 1; }
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
 
     struct hostent *he = gethostbyname(server_ip);
     if (!he) {
@@ -202,43 +205,57 @@ int main(void) {
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("connect");
+        fprintf(stderr, "Could not connect to %s:%d\n", server_ip, port);
         return 1;
     }
 
-    printf("[worker] Connected to server %s:%d\n", server_ip, port);
+    printf("[client] Connected to server %s:%d\n", server_ip, port);
+    printf("[client] Waiting for jobs from server...\n");
     fflush(stdout);
 
     while (1) {
         uint8_t msg;
-        if (recv_u8(fd, &msg) < 0) break;
+        if (recv_u8(fd, &msg) < 0) {
+            printf("\n[client] Server disconnected. Exiting.\n");
+            break;
+        }
+
+        if (msg == MSG_QUERY_LOAD) {
+            if (send_u32(fd, get_jobs()) < 0) break;
+            continue;
+        }
 
         if (msg == MSG_RUN_CODE) {
             uint32_t src_len = 0;
             char *source = recv_string(fd, &src_len);
             if (!source) break;
 
-            inc_jobs();
-            printf("[worker] Running job. Active jobs = %u\n", get_jobs());
+            printf("[client] Received job (%u bytes) — running C code...\n", src_len);
             fflush(stdout);
 
-            uint32_t out_len = 0;
-            char *output = run_code(source, &out_len);
-
+            inc_jobs();
+            char *output = run_code(source, &src_len);
             dec_jobs();
 
+            uint32_t out_len = (uint32_t)strlen(output);
+
             if (send_string(fd, output, out_len) < 0) {
+                printf("[client] Failed to send output. Server may have disconnected.\n");
                 free(source);
                 free(output);
                 break;
             }
 
+            printf("[client] Output sent. Waiting for next job...\n");
+            fflush(stdout);
+
             free(source);
             free(output);
-        } else if (msg == MSG_QUERY_LOAD) {
-            send_u32(fd, get_jobs());
-        } else {
-            break;
+            continue;
         }
+
+        printf("[client] Unknown message type. Closing.\n");
+        break;
     }
 
     close(fd);
