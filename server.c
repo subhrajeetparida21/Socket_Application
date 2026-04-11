@@ -1,36 +1,34 @@
 /*
- * node.c  —  Lab-machine worker  (Machine B)
+ * server.c — Code Distribution Server  (Machine A)
  *
- * Compile:  gcc node.c common.c -o node -lpthread
- * Run:      ./node          (default port 9010)
- *           ./node 9011     (custom port)
+ * Compile:  gcc server.c common.c -o server -lpthread
+ * Run:      ./server
  *
- * Responsibilities:
- *   1. Maintains a LOCAL SERVER that listens for connections from Machine A.
- *   2. Responds to load queries  (MSG_QUERY_LOAD)  with its active-job count.
- *   3. Receives a compiled binary (MSG_RUN_BINARY), executes it in a temp
- *      directory, and returns stdout+stderr to Machine A.
+ * Workflow:
+ *   1. User registers one or more nodes (Machine B) by entering IP + port.
+ *   2. User picks a .c file from the current directory.
+ *   3. Server compiles it locally with gcc into a temp binary.
+ *   4. Server queries each registered node for its active-job load.
+ *   5. Server shows a menu:
+ *        [auto]   — send to least-loaded node automatically
+ *        [1..N]   — send to a specific node chosen by user
+ *   6. Server sends the binary to the chosen node (MSG_RUN_BINARY).
+ *   7. Server receives the output and prints it.
  *
- * BUG-FIXES over original:
- *   - mkstemps suffix length was 4 but ".txt" is 4 chars — now correct.
- *   - Binary temp file was closed then re-opened by write_all; fixed by
- *     writing before close.
- *   - run_binary now accepts output file path via mkstemps properly.
- *   - All error paths free memory and close fds correctly.
- *   - Added SIGCHLD handler so zombie children are reaped automatically.
- *   - Added a 60-second execution timeout via alarm() to prevent runaway jobs.
- *   - thread detach happens before work, not after, to avoid rare race.
+ * The node (node.c) handles MSG_QUERY_LOAD and MSG_RUN_BINARY.
  */
 
 #define _GNU_SOURCE
 #include "common.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
-#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,254 +38,447 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-/* ── active-job counter ──────────────────────────────────────────────── */
-static pthread_mutex_t g_load_mutex  = PTHREAD_MUTEX_INITIALIZER;
-static uint32_t        g_active_jobs = 0;
+/* ── node registry ───────────────────────────────────────────────────── */
+typedef struct {
+    char ip[INET_ADDRSTRLEN];
+    int  port;
+    int  alive;            /* 1 = reachable, 0 = last ping failed */
+    uint32_t load;         /* last known active-job count          */
+} NodeInfo;
 
-static void     inc_load(void){ pthread_mutex_lock(&g_load_mutex); g_active_jobs++;                     pthread_mutex_unlock(&g_load_mutex); }
-static void     dec_load(void){ pthread_mutex_lock(&g_load_mutex); if(g_active_jobs) g_active_jobs--;   pthread_mutex_unlock(&g_load_mutex); }
-static uint32_t get_load(void){ uint32_t v; pthread_mutex_lock(&g_load_mutex); v=g_active_jobs; pthread_mutex_unlock(&g_load_mutex); return v; }
+static NodeInfo g_nodes[MAX_NODES];
+static int      g_node_count = 0;
 
-/* ── write_all helper ────────────────────────────────────────────────── */
-static int write_all(int fd, const void *buf, size_t len){
-    const char *p = (const char *)buf;
-    size_t sent = 0;
-    while(sent < len){
-        ssize_t n = write(fd, p+sent, len-sent);
-        if(n <= 0) return -1;
-        sent += (size_t)n;
+/* ── ANSI colour helpers ─────────────────────────────────────────────── */
+#define CLR_RESET  "\033[0m"
+#define CLR_BOLD   "\033[1m"
+#define CLR_GREEN  "\033[32m"
+#define CLR_CYAN   "\033[36m"
+#define CLR_YELLOW "\033[33m"
+#define CLR_RED    "\033[31m"
+#define CLR_BLUE   "\033[34m"
+
+/* ── open a short-lived TCP connection to a node ─────────────────────── */
+static int connect_to_node(const char *ip, int port) {
+    struct hostent *he = gethostbyname(ip);
+    if (!he) return -1;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    /* 3-second connect timeout via SO_RCVTIMEO / SO_SNDTIMEO */
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    memcpy(&addr.sin_addr.s_addr, he->h_addr, he->h_length);
+
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
     }
+    return fd;
+}
+
+/* ── query one node's load (MSG_QUERY_LOAD) ──────────────────────────── */
+static int query_node_load(NodeInfo *n) {
+    int fd = connect_to_node(n->ip, n->port);
+    if (fd < 0) {
+        n->alive = 0;
+        n->load  = UINT32_MAX;   /* treat as infinitely busy */
+        return -1;
+    }
+    if (send_u32(fd, MSG_QUERY_LOAD) < 0 || recv_u32(fd, &n->load) < 0) {
+        close(fd);
+        n->alive = 0;
+        n->load  = UINT32_MAX;
+        return -1;
+    }
+    close(fd);
+    n->alive = 1;
     return 0;
 }
 
-/* ── read a file into malloc'd buffer ───────────────────────────────── */
-static char *read_output_file(const char *path, uint32_t *out_len){
-    FILE *fp = fopen(path, "rb");
-    if(!fp){
-        const char *msg = "(node: could not open output file)\n";
-        *out_len = (uint32_t)strlen(msg);
-        return strdup(msg);
-    }
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if(sz <= 0){
-        fclose(fp);
-        const char *msg = "(program produced no output)\n";
-        *out_len = (uint32_t)strlen(msg);
-        return strdup(msg);
-    }
-    char *buf = (char *)malloc((size_t)sz + 1);
-    if(!buf){ fclose(fp); const char *msg="(node: malloc failed)\n"; *out_len=(uint32_t)strlen(msg); return strdup(msg); }
-    size_t nr = fread(buf, 1, (size_t)sz, fp); (void)nr;
-    buf[sz] = '\0';
-    fclose(fp);
-    *out_len = (uint32_t)sz;
-    return buf;
+/* ── refresh load for every registered node ──────────────────────────── */
+static void refresh_all_loads(void) {
+    printf(CLR_CYAN "[server] Querying node loads...\n" CLR_RESET);
+    for (int i = 0; i < g_node_count; i++)
+        query_node_load(&g_nodes[i]);
 }
 
-/*
- * run_binary()
- *
- * FIX: original code called mkstemp then closed the fd, then tried to
- * write_all using a stale fd — now we write before closing.
- * FIX: mkstemps suffix ".txt" is 4 bytes — corrected suffix length.
- * FIX: added 60-second alarm timeout so a runaway child can't block the node.
- */
-static char *run_binary(const char *binary, uint32_t bin_len, uint32_t *out_len){
-    /* temp file for the ELF binary — write payload, then close, chmod */
-    char bin_tpl[] = "/tmp/lab_node_bin_XXXXXX";
+/* ── compile a .c file locally, return binary in malloc'd buffer ─────── */
+static char *compile_local(const char *src_path, uint32_t *out_len) {
+    /* Temp file for the output binary */
+    char bin_tpl[] = "./lab_server_bin_XXXXXX";
     int  bin_fd    = mkstemp(bin_tpl);
-    if(bin_fd < 0){
-        const char *msg = "(node: mkstemp failed for binary)\n";
-        *out_len = (uint32_t)strlen(msg); return strdup(msg);
+    if (bin_fd < 0) {
+        fprintf(stderr, "[server] mkstemp for binary failed: %s\n", strerror(errno));
+        return NULL;
     }
-    /* FIX: write while fd is still open */
-    if(write_all(bin_fd, binary, (size_t)bin_len) < 0){
-        close(bin_fd); unlink(bin_tpl);
-        const char *msg = "(node: failed to write binary)\n";
-        *out_len = (uint32_t)strlen(msg); return strdup(msg);
-    }
-    close(bin_fd);
-    chmod(bin_tpl, 0700);
+    close(bin_fd);   /* gcc will (re-)create/overwrite it */
 
-    /* temp file for captured stdout+stderr */
-    /* FIX: suffix length must match literal ".txt" = 4 chars */
-    char out_tpl[] = "/tmp/lab_node_out_XXXXXX.txt";
-    int  out_fd    = mkstemps(out_tpl, 4);
-    if(out_fd < 0){
+    /* Temp file to capture compiler output (errors/warnings) */
+    char err_tpl[] = "./lab_server_err_XXXXXX.txt";
+    int  err_fd    = mkstemps(err_tpl, 4);
+    if (err_fd < 0) {
         unlink(bin_tpl);
-        const char *msg = "(node: mkstemps failed for output)\n";
-        *out_len = (uint32_t)strlen(msg); return strdup(msg);
+        return NULL;
     }
-    close(out_fd);
+    close(err_fd);
+
+    printf("[server] Compiling " CLR_BOLD "%s" CLR_RESET " locally...\n", src_path);
 
     pid_t pid = fork();
-    if(pid == 0){
-        /* child: redirect stdout+stderr into output file, then exec */
-        int ofd = open(out_tpl, O_WRONLY | O_TRUNC);
-        if(ofd >= 0){ dup2(ofd, STDOUT_FILENO); dup2(ofd, STDERR_FILENO); close(ofd); }
-        alarm(60);          /* kill self if it runs more than 60 s */
-        execl(bin_tpl, bin_tpl, NULL);
-        _exit(127);
+    if (pid == 0) {
+        /* Child: redirect stderr → compiler error file */
+        int ofd = open(err_tpl, O_WRONLY | O_TRUNC);
+        if (ofd >= 0) { dup2(ofd, STDERR_FILENO); close(ofd); }
+        execlp("gcc", "gcc", src_path, "-O2", "-o", bin_tpl, NULL);
+        _exit(1);
     }
-    if(pid < 0){
-        unlink(bin_tpl); unlink(out_tpl);
-        const char *msg = "(node: fork() failed)\n";
-        *out_len = (uint32_t)strlen(msg); return strdup(msg);
+    if (pid < 0) {
+        unlink(bin_tpl); unlink(err_tpl);
+        fprintf(stderr, "[server] fork() failed.\n");
+        return NULL;
     }
 
     int status = 0;
     waitpid(pid, &status, 0);
 
-    /* Append exit-code note so the user can see if the program crashed */
-    char *result = read_output_file(out_tpl, out_len);
-    unlink(bin_tpl);
-    unlink(out_tpl);
-
-    /* FIX: append exit status info to output */
-    if(WIFEXITED(status) && WEXITSTATUS(status) != 0){
-        char note[64];
-        snprintf(note, sizeof(note), "\n[node] Process exited with code %d\n", WEXITSTATUS(status));
-        size_t note_len = strlen(note);
-        char *combined  = (char *)realloc(result, *out_len + note_len + 1);
-        if(combined){
-            memcpy(combined + *out_len, note, note_len + 1);
-            *out_len += (uint32_t)note_len;
-            result    = combined;
+    /* Show compiler errors/warnings regardless */
+    FILE *ef = fopen(err_tpl, "r");
+    if (ef) {
+        char line[512];
+        int  first = 1;
+        while (fgets(line, sizeof(line), ef)) {
+            if (first) { printf(CLR_YELLOW "[gcc] " CLR_RESET); first = 0; }
+            printf("%s", line);
         }
-    } else if(WIFSIGNALED(status)){
-        char note[64];
-        snprintf(note, sizeof(note), "\n[node] Process killed by signal %d\n", WTERMSIG(status));
-        size_t note_len = strlen(note);
-        char *combined  = (char *)realloc(result, *out_len + note_len + 1);
-        if(combined){
-            memcpy(combined + *out_len, note, note_len + 1);
-            *out_len += (uint32_t)note_len;
-            result    = combined;
-        }
+        fclose(ef);
     }
-    return result;
+    unlink(err_tpl);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, CLR_RED "[server] Compilation FAILED.\n" CLR_RESET);
+        unlink(bin_tpl);
+        return NULL;
+    }
+
+    printf(CLR_GREEN "[server] Compilation successful.\n" CLR_RESET);
+
+    /* Read compiled binary into memory */
+    FILE *fp = fopen(bin_tpl, "rb");
+    if (!fp) {
+        fprintf(stderr, "[server] Cannot open compiled binary.\n");
+        unlink(bin_tpl);
+        return NULL;
+    }
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (sz <= 0) {
+        fclose(fp); unlink(bin_tpl);
+        fprintf(stderr, "[server] Compiled binary is empty.\n");
+        return NULL;
+    }
+    char *buf = (char *)malloc((size_t)sz);
+    if (!buf) { fclose(fp); unlink(bin_tpl); return NULL; }
+    size_t nr = fread(buf, 1, (size_t)sz, fp); (void)nr;
+    fclose(fp);
+    unlink(bin_tpl);
+
+    *out_len = (uint32_t)sz;
+    printf("[server] Binary size: %u bytes\n", *out_len);
+    return buf;
 }
 
-/* ── per-connection handler thread ──────────────────────────────────── */
-static void *handle_connection(void *arg){
-    int fd = *(int *)arg;
-    free(arg);
-
-    uint32_t msg_type = 0;
-    if(recv_u32(fd, &msg_type) < 0){ close(fd); return NULL; }
-
-    if(msg_type == MSG_QUERY_LOAD){
-        uint32_t load = get_load();
-        send_u32(fd, load);
-        printf("[node] Load query → %u active job(s)\n", load);
-        fflush(stdout);
-
-    } else if(msg_type == MSG_RUN_BINARY){
-        uint32_t  bin_len = 0;
-        char     *binary  = recv_string(fd, &bin_len);
-        if(!binary){
-            fprintf(stderr, "[node] Failed to receive binary payload.\n");
-            close(fd); return NULL;
-        }
-
-        inc_load();
-        printf("[node] Binary received (%u bytes). Running... (load now: %u)\n",
-               bin_len, get_load());
-        fflush(stdout);
-
-        uint32_t out_len = 0;
-        char    *output  = run_binary(binary, bin_len, &out_len);
-        free(binary);
-
-        if(send_string(fd, output, out_len) < 0)
-            fprintf(stderr, "[node] Failed to send output back.\n");
-
-        dec_load();
-        printf("[node] Job done. Sent %u bytes of output. (load now: %u)\n",
-               out_len, get_load());
-        fflush(stdout);
-        free(output);
-
-    } else {
-        fprintf(stderr, "[node] Unknown message type: %u\n", msg_type);
+/* ── send binary to one node, collect output ─────────────────────────── */
+static char *dispatch_to_node(NodeInfo *n,
+                               const char *binary, uint32_t bin_len,
+                               uint32_t *out_len) {
+    int fd = connect_to_node(n->ip, n->port);
+    if (fd < 0) {
+        n->alive = 0;
+        const char *msg = "(node unreachable)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
     }
 
+    /* Extend timeout for execution (binary might run a while) */
+    struct timeval tv = { .tv_sec = 60, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    /* Send message type, then binary payload */
+    if (send_u32(fd, MSG_RUN_BINARY) < 0 ||
+        send_string(fd, binary, bin_len) < 0) {
+        close(fd);
+        n->alive = 0;
+        const char *msg = "(failed to send binary to node)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
+    }
+
+    /* Receive output */
+    char *output = recv_string(fd, out_len);
     close(fd);
-    return NULL;
+
+    if (!output) {
+        const char *msg = "(no response from node)\n";
+        *out_len = (uint32_t)strlen(msg);
+        return strdup(msg);
+    }
+    return output;
+}
+
+/* ── list .c files in the current directory ───────────────────────────── */
+static int list_c_files(char files[][256], int max) {
+    DIR *d = opendir(".");
+    if (!d) return 0;
+    int count = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && count < max) {
+        size_t n = strlen(e->d_name);
+        if (n > 2 && strcmp(e->d_name + n - 2, ".c") == 0) {
+            if (strcmp(e->d_name, "server.c") == 0 ||
+                strcmp(e->d_name, "node.c")   == 0 ||
+                strcmp(e->d_name, "common.c") == 0 ||
+                strncmp(e->d_name, "client", 6) == 0) {
+                continue;
+            }
+            snprintf(files[count], 256, "%s", e->d_name);
+            count++;
+        }
+    }
+    closedir(d);
+    return count;
+}
+
+/* ── print the node table with load info ─────────────────────────────── */
+static void print_node_table(void) {
+    printf("\n  %-4s %-18s %-8s %-12s\n", "Idx", "IP Address", "Port", "Active Jobs");
+    printf("  %-4s %-18s %-8s %-12s\n",
+           "───", "──────────────────", "────────", "──────────");
+    for (int i = 0; i < g_node_count; i++) {
+        NodeInfo *n = &g_nodes[i];
+        const char *status_clr = n->alive ? CLR_GREEN : CLR_RED;
+        const char *load_str   = n->alive ? "" : " (OFFLINE)";
+        printf("  " CLR_BOLD "[%d]" CLR_RESET " %-18s %-8d %s",
+               i + 1, n->ip, n->port, status_clr);
+        if (n->alive)
+            printf("%-12u" CLR_RESET "%s\n", n->load, load_str);
+        else
+            printf("???%s" CLR_RESET "\n", load_str);
+    }
+    printf("\n");
 }
 
 /* ── main ───────────────────────────────────────────────────────────── */
-int main(int argc, char *argv[]){
-    int port = DEFAULT_NODE_BASE_PORT;
-
-    if(argc >= 2){
-        port = atoi(argv[1]);
-        if(port <= 0 || port > 65535) port = DEFAULT_NODE_BASE_PORT;
-    } else {
-        char input[32];
-        printf("Enter node listen port [%d]: ", DEFAULT_NODE_BASE_PORT);
-        fflush(stdout);
-        if(fgets(input, sizeof(input), stdin)){
-            input[strcspn(input,"\n")] = '\0';
-            if(input[0] != '\0'){
-                int p = atoi(input);
-                if(p > 0 && p <= 65535) port = p;
-            }
-        }
-    }
-
-    /* FIX: reap zombie children automatically */
-    signal(SIGCHLD, SIG_IGN);
-
-    int listener = socket(AF_INET, SOCK_STREAM, 0);
-    if(listener < 0){ perror("socket"); return 1; }
-
-    int opt = 1;
-    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons((uint16_t)port);
-
-    if(bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0){
-        perror("bind"); close(listener); return 1;
-    }
-    if(listen(listener, 64) < 0){
-        perror("listen"); close(listener); return 1;
-    }
+int main(void) {
+    char input[256];
 
     printf("╔══════════════════════════════════════════╗\n");
-    printf("║         NODE WORKER — READY               ║\n");
-    printf("╚══════════════════════════════════════════╝\n");
-    printf("[node] Listening on port %d\n", port);
-    printf("[node] Waiting for jobs from server (Machine A)...\n\n");
-    fflush(stdout);
+    printf("║     DISTRIBUTED EXECUTION SERVER (A)      ║\n");
+    printf("╚══════════════════════════════════════════╝\n\n");
 
-    while(1){
-        int *cfd = (int *)malloc(sizeof(int));
-        if(!cfd) continue;
+    /* ── Step 1: Register nodes ── */
+    printf("Register worker nodes (Machine B).\n");
+    printf("Type 'done' when finished, or just press ENTER to skip if already added.\n\n");
 
-        *cfd = accept(listener, NULL, NULL);
-        if(*cfd < 0){ free(cfd); continue; }
+    while (g_node_count < MAX_NODES) {
+        printf("Node %d — IP address (or 'done'): ", g_node_count + 1);
+        fflush(stdout);
+        if (!fgets(input, sizeof(input), stdin)) break;
+        input[strcspn(input, "\n")] = '\0';
+        if (strcmp(input, "done") == 0 || input[0] == '\0') break;
 
-        pthread_t tid;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        /* FIX: set detached at creation — avoids rare race where handle_connection
-           finishes before pthread_detach() is called in the main thread */
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        NodeInfo *n = &g_nodes[g_node_count];
+        snprintf(n->ip, INET_ADDRSTRLEN, "%.*s", INET_ADDRSTRLEN - 1, input);
 
-        if(pthread_create(&tid, &attr, handle_connection, cfd) != 0){
-            close(*cfd); free(cfd);
-        }
-        pthread_attr_destroy(&attr);
+        printf("Node %d — Port [%d]: ", g_node_count + 1, DEFAULT_NODE_BASE_PORT);
+        fflush(stdout);
+        if (!fgets(input, sizeof(input), stdin)) break;
+        input[strcspn(input, "\n")] = '\0';
+        n->port  = (input[0] != '\0') ? atoi(input) : DEFAULT_NODE_BASE_PORT;
+        n->alive = 0;
+        n->load  = 0;
+        g_node_count++;
+        printf(CLR_GREEN "  → Node %d registered: %s:%d\n" CLR_RESET,
+               g_node_count, n->ip, n->port);
     }
 
-    close(listener);
+    if (g_node_count == 0) {
+        fprintf(stderr, "[server] No nodes registered. Exiting.\n");
+        return 1;
+    }
+
+    printf("\n" CLR_BOLD "[server] %d node(s) registered. Ready.\n\n" CLR_RESET,
+           g_node_count);
+
+    /* ── Main loop ── */
+    char c_files[64][256];
+
+    while (1) {
+        printf("══════════════════════════════════════════\n");
+        printf("Commands:\n");
+        printf("  " CLR_BOLD "run" CLR_RESET "   — compile a .c file and dispatch to a node\n");
+        printf("  " CLR_BOLD "nodes" CLR_RESET " — show registered nodes and their load\n");
+        printf("  " CLR_BOLD "add"  CLR_RESET "   — register another node\n");
+        printf("  " CLR_BOLD "quit" CLR_RESET "  — exit\n");
+        printf("> ");
+        fflush(stdout);
+
+        if (!fgets(input, sizeof(input), stdin)) break;
+        input[strcspn(input, "\n")] = '\0';
+
+        /* ── 'nodes' ── */
+        if (strcmp(input, "nodes") == 0) {
+            refresh_all_loads();
+            print_node_table();
+            continue;
+        }
+
+        /* ── 'add' ── */
+        if (strcmp(input, "add") == 0) {
+            if (g_node_count >= MAX_NODES) {
+                printf("[server] Maximum node limit reached.\n");
+                continue;
+            }
+            NodeInfo *n = &g_nodes[g_node_count];
+            printf("New node IP: "); fflush(stdout);
+            if (!fgets(input, sizeof(input), stdin)) break;
+            input[strcspn(input, "\n")] = '\0';
+            snprintf(n->ip, INET_ADDRSTRLEN, "%.*s", INET_ADDRSTRLEN - 1, input);
+
+            printf("New node port [%d]: ", DEFAULT_NODE_BASE_PORT); fflush(stdout);
+            if (!fgets(input, sizeof(input), stdin)) break;
+            input[strcspn(input, "\n")] = '\0';
+            n->port  = (input[0] != '\0') ? atoi(input) : DEFAULT_NODE_BASE_PORT;
+            n->alive = 0;
+            n->load  = 0;
+            g_node_count++;
+            printf(CLR_GREEN "  → Node %d added: %s:%d\n\n" CLR_RESET,
+                   g_node_count, n->ip, n->port);
+            continue;
+        }
+
+        /* ── 'quit' ── */
+        if (strcmp(input, "quit") == 0 || strcmp(input, "exit") == 0) {
+            printf("[server] Goodbye.\n");
+            break;
+        }
+
+        /* ── 'run' ── */
+        if (strcmp(input, "run") != 0) {
+            printf("[server] Unknown command. Try: run / nodes / add / quit\n");
+            continue;
+        }
+
+        /* 1. List .c files */
+        int nfiles = list_c_files(c_files, 64);
+        if (nfiles == 0) {
+            printf("[server] No .c files found in the current directory.\n");
+            continue;
+        }
+        printf("\n" CLR_BOLD "C files in current directory:\n" CLR_RESET);
+        for (int i = 0; i < nfiles; i++)
+            printf("  [%d] %s\n", i + 1, c_files[i]);
+        printf("Pick a file (1-%d): ", nfiles);
+        fflush(stdout);
+
+        if (!fgets(input, sizeof(input), stdin)) break;
+        int choice = atoi(input);
+        if (choice < 1 || choice > nfiles) {
+            printf("[server] Invalid choice.\n");
+            continue;
+        }
+        char *src_path = c_files[choice - 1];
+
+        /* 2. Compile locally */
+        uint32_t bin_len = 0;
+        char *binary = compile_local(src_path, &bin_len);
+        if (!binary) continue;   /* error already printed */
+
+        /* 3. Refresh node loads */
+        refresh_all_loads();
+        print_node_table();
+
+        /* ── Verify at least one alive node ── */
+        int alive_count = 0;
+        int least_loaded_idx = -1;
+        uint32_t min_load = UINT32_MAX;
+
+        for (int i = 0; i < g_node_count; i++) {
+            if (g_nodes[i].alive) {
+                alive_count++;
+                if (g_nodes[i].load < min_load) {
+                    min_load = g_nodes[i].load;
+                    least_loaded_idx = i;
+                }
+            }
+        }
+
+        if (alive_count == 0) {
+            printf(CLR_RED "[server] No nodes are online. Cannot dispatch.\n" CLR_RESET);
+            free(binary);
+            continue;
+        }
+
+        /* 4. Let user choose target node */
+        printf("Select target node:\n");
+        printf("  [0]  Auto — send to least-loaded node "
+               CLR_CYAN "(Node %d, load=%u)" CLR_RESET "\n",
+               least_loaded_idx + 1,
+               g_nodes[least_loaded_idx].load);
+        for (int i = 0; i < g_node_count; i++) {
+            if (!g_nodes[i].alive) continue;
+            printf("  [%d]  %s:%d  (load: %u)\n",
+                   i + 1, g_nodes[i].ip, g_nodes[i].port, g_nodes[i].load);
+        }
+        printf("Choice [0 = auto]: ");
+        fflush(stdout);
+
+        if (!fgets(input, sizeof(input), stdin)) { free(binary); break; }
+        int node_choice = atoi(input);
+
+        NodeInfo *target = NULL;
+        if (node_choice == 0) {
+            target = &g_nodes[least_loaded_idx];
+        } else if (node_choice >= 1 && node_choice <= g_node_count) {
+            target = &g_nodes[node_choice - 1];
+            if (!target->alive) {
+                printf(CLR_RED "[server] Node %d is offline.\n" CLR_RESET, node_choice);
+                free(binary);
+                continue;
+            }
+        } else {
+            printf("[server] Invalid selection.\n");
+            free(binary);
+            continue;
+        }
+
+        printf("\n" CLR_BOLD "[server] Dispatching '%s' (%u bytes) to %s:%d...\n"
+               CLR_RESET, src_path, bin_len, target->ip, target->port);
+
+        /* 5. Send binary and wait for output */
+        uint32_t out_len = 0;
+        char *output = dispatch_to_node(target, binary, bin_len, &out_len);
+
+        printf("\n");
+        printf("╔══════════════════════════════════════════╗\n");
+        printf("║   OUTPUT from %s:%-5d                \n", target->ip, target->port);
+        printf("╚══════════════════════════════════════════╝\n");
+        printf("%s", output ? output : "(null output)");
+        if (out_len > 0 && output[out_len - 1] != '\n') printf("\n");
+        printf("══════════════════════════════════════════\n\n");
+
+        free(output);
+        free(binary);
+    }
+
     return 0;
 }
